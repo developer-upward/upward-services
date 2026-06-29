@@ -2785,7 +2785,7 @@ const CONFIG_GDRIVE_PICKER = {
   SCOPE:         'https://www.googleapis.com/auth/drive.file'
 };
 
-const gdriveOauth2Client = new google.auth.OAuth2(CONFIG_GDRIVE_PICKER.CLIENT_ID, CONFIG_GDRIVE_PICKER.CLIENT_SECRET, `https://services.upward.page/login/gdrive_picker/callback`
+const gdriveOauth2Client = new google.auth.OAuth2(CONFIG_GDRIVE_PICKER.CLIENT_ID, CONFIG_GDRIVE_PICKER.CLIENT_SECRET, `https://${CONFIG_GDRIVE_PICKER.COMPANION_DOMAIN}/login/gdrive_picker/callback`
 );
 
 function generateGDriveStateToken(origin) {
