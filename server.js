@@ -2776,19 +2776,16 @@ app.get('/login/tokeninfo/linkedin', (req, res) => {
 
 
 const CONFIG_GDRIVE_PICKER = {
-  CLIENT_ID:     '231297576692-c70ckvdglp7vtnamitq3h2ccrodkdi8a.apps.googleusercontent.com',      // format: XXXXXXXXXXXX-abc123.apps.googleusercontent.com
-  CLIENT_SECRET: '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',
-  JWT_SECRET:    'super_secret_change_me',
+  CLIENT_ID:     process.env.GOOGLE_DRIVE_CLIENT_ID,
+  CLIENT_SECRET: process.env.GOOGLE_DRIVE_CLIENT_SECRET,
+  JWT_SECRET:    process.env.COMPANION_SECRET,
   COMPANION_DOMAIN: 'services.upward.page',
   COOKIE_NAME:   'gdrive_picker_state',
   TOKEN_EXPIRY:  '3m',
   SCOPE:         'https://www.googleapis.com/auth/drive.file'
 };
 
-const gdriveOauth2Client = new google.auth.OAuth2(
-  '231297576692-c70ckvdglp7vtnamitq3h2ccrodkdi8a.apps.googleusercontent.com',
-  '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',
-  `https://services.upward.page/login/gdrive_picker/callback`
+const gdriveOauth2Client = new google.auth.OAuth2(CONFIG_GDRIVE_PICKER.CLIENT_ID, CONFIG_GDRIVE_PICKER.CLIENT_SECRET, `https://services.upward.page/login/gdrive_picker/callback`
 );
 
 function generateGDriveStateToken(origin) {
