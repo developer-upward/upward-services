@@ -1,0 +1,4045 @@
+require('dotenv').config();
+const express = require('express');
+const session = require('express-session');
+const bodyParser = require('body-parser');
+const companion = require('@uppy/companion');
+const formidable = require('formidable');
+const fs = require('fs/promises');
+const fsSync = require('fs'); // For fs.createReadStream
+const fetch = require('node-fetch');
+const { randomUUID } = require('crypto');
+const path = require('path');
+const cors = require('cors');
+// Google Calendar
+const { google } = require('googleapis');
+const jwt = require('jsonwebtoken');
+// IPX
+const { createIPX, ipxFSStorage, ipxHttpStorage, createIPXNodeServer } = require('ipx');
+const axios = require('axios');
+const dns = require('dns').promises;
+const { encrypt } = require('./encryption');
+
+
+// AWS SDK v3
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+
+// Wasabi Config
+const WASABI_BUCKET = process.env.WASABI_BUCKET;
+const WASABI_REGION = process.env.WASABI_REGION;
+const WASABI_ENDPOINT = process.env.WASABI_ENDPOINT;
+const WASABI_KEY = process.env.WASABI_KEY;
+const WASABI_SECRET = process.env.WASABI_SECRET;
+
+// Mux Config
+const MUX_TOKEN_ID = process.env.MUX_TOKEN_ID;
+const MUX_TOKEN_SECRET = process.env.MUX_TOKEN_SECRET;
+
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(() => { });
+
+// S3: Wasabi (SDK v3)
+const s3 = new S3Client({
+  endpoint: WASABI_ENDPOINT,
+  region: WASABI_REGION,
+  credentials: {
+    accessKeyId: WASABI_KEY,
+    secretAccessKey: WASABI_SECRET
+  },
+  forcePathStyle: true // Important for Wasabi
+});
+
+const isVideoOrAudio = mimetype =>
+  mimetype && (
+    mimetype.startsWith('video/') ||
+    mimetype.startsWith('audio/') ||
+    mimetype === 'application/mp4'
+  );
+
+// ---- Streaming upload helpers
+
+async function uploadToWasabi({ filepath, wasabiKey, mimetype, wasabiConfig }) {
+  const fileStream = fsSync.createReadStream(filepath);
+  
+  // Create specific client for this upload
+  const client = createS3Client(wasabiConfig);
+
+  const command = new PutObjectCommand({
+    Bucket: wasabiConfig.bucket,
+    Key: wasabiKey,
+    ContentType: mimetype || 'application/octet-stream',
+    ACL: 'public-read'
+  });
+
+  const url = await getSignedUrl(client, command, { expiresIn: 600 });
+
+  const resp = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': mimetype || 'application/octet-stream',
+      'x-amz-acl': 'public-read'
+    },
+    body: fileStream
+  });
+
+  if (!resp.ok) {
+    const msg = await resp.text();
+    throw new Error(`Wasabi PUT failed: ${resp.status} - ${msg}`);
+  }
+  
+  // Construct URL based on the config endpoint/bucket
+  // Removing 'https://' from endpoint to construct standard path style if needed, 
+  // or just use standard Wasabi format if endpoint is standard.
+  // Defaulting to standard structure:
+  const regionStr = wasabiConfig.region ? `.${wasabiConfig.region}` : '';
+  // Check if endpoint is custom or standard wasabi
+  if (wasabiConfig.endpoint.includes('wasabisys.com')) {
+     return `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`;
+  } else {
+     // Fallback for custom endpoints (though Wasabi usually follows above)
+     return `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
+  }
+}
+
+async function uploadToMux({ filepath, mimetype, originalFilename, tokenId, tokenSecret }) {
+  const external_id = randomUUID();
+
+  // Ensure we have valid credentials (either default or private)
+  if (!tokenId || !tokenSecret) {
+    throw new Error("Mux Credentials are missing (ID or Secret is null)");
+  }
+
+  const response = await fetch('https://api.mux.com/video/v1/uploads', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      // USE PASSED CREDENTIALS
+      'Authorization': 'Basic ' + Buffer.from(`${tokenId}:${tokenSecret}`).toString('base64')
+    },
+    body: JSON.stringify({
+      new_asset_settings: {
+        playback_policies: ['public'],
+        passthrough: originalFilename,
+        meta: { external_id },
+        master_access: "temporary"
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`MUX upload create failed: ${response.status}: ${text}`);
+  }
+  const json = await response.json();
+  const upload_url = json.data.url;
+  const upload_id = json.data.id;
+
+  const fileStream = fsSync.createReadStream(filepath);
+
+  const uploadResp = await fetch(upload_url, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': mimetype || 'application/octet-stream',
+      'Origin': '*'
+    },
+    body: fileStream
+  });
+  if (!uploadResp.ok) {
+    const text = await uploadResp.text();
+    throw new Error(`MUX upload PUT failed: ${uploadResp.status}: ${text}`);
+  }
+
+  return {
+    mux_upload_id: upload_id,
+    upload_url,
+    external_id
+  };
+}
+
+// ---- Express Setup
+
+const app = express();
+app.use(cors({ origin: '*', credentials: false }));
+// Modified Body Parser to save the raw buffer for Facebook Webhook verification
+app.use(bodyParser.json({ 
+  limit: '50mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+
+
+app.use(session({
+  secret: process.env.COMPANION_SECRET,
+  resave: false,
+  saveUninitialized: true,
+  cookie: {
+    secure: false,
+    sameSite: 'lax',
+    maxAge: 24 * 60 * 60 * 1000
+  }
+}));
+
+const options = {
+  providerOptions: {
+    drive: {
+      key: process.env.GOOGLE_KEY,
+      secret: process.env.GOOGLE_SECRET
+    },
+    dropbox: {
+      key: process.env.DROPBOX_KEY,
+      secret: process.env.DROPBOX_SECRET
+    },
+    onedrive: {
+      key: process.env.ONEDRIVE_KEY,
+      secret: process.env.ONEDRIVE_SECRET
+    }
+  },
+  server: {
+    host: process.env.COMPANION_DOMAIN,
+    protocol: 'https'
+  },
+  filePath: '/tmp',
+  secret: process.env.COMPANION_SECRET,
+  debug: true,
+  uploadUrls: ['.*']
+};
+
+const { app: companionApp } = companion.app(options);
+app.use(companionApp);
+
+app.options('/upload', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, POST');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
+async function getMuxCredentials(memberUniqueId) {
+  // 1. Initialize with Default Environment Variables
+  let credentials = {
+    id: MUX_TOKEN_ID,
+    secret: MUX_TOKEN_SECRET
+  };
+
+  // If no member ID is provided, strictly use defaults
+  if (!memberUniqueId) return credentials;
+
+  try {
+    // 2. Always query the API
+    const response = await fetch("https://upward.page/api/1.1/wf/get_mux_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member_unique_id: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      
+      // Bubble responses usually nest data inside a "response" object.
+      // We handle both flat structure and nested structure just in case.
+      const data = json.response || json;
+
+      // 3. Check the flag
+      // Convert to boolean in case it comes as string "true"
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        // Only override if the new keys actually exist
+        if (data.mux_token_id && data.mux_token_secret) {
+          credentials.id = data.mux_token_id;
+          credentials.secret = data.mux_token_secret;
+        } else {
+          console.warn(`[Mux Auth] Private Label requested for ${memberUniqueId} but keys missing. Using default.`);
+        }
+      } 
+      // If private_labelled is false, we simply do nothing and return the `credentials` object (which holds defaults)
+    }
+  } catch (error) {
+    console.error(`[Mux Auth] API check failed for ${memberUniqueId}:`, error.message);
+    // On error, we silently fall back to defaults
+  }
+
+  return credentials;
+}
+
+async function getWasabiCredentials(memberUniqueId) {
+  // 1. Default Configuration
+  let config = {
+    bucket: process.env.WASABI_BUCKET,
+    region: process.env.WASABI_REGION,
+    endpoint: process.env.WASABI_ENDPOINT,
+    accessKeyId: process.env.WASABI_KEY,
+    secretAccessKey: process.env.WASABI_SECRET
+  };
+
+  if (!memberUniqueId) return config;
+
+  try {
+    // 2. Query API
+    const response = await fetch("https://upward.page/api/1.1/wf/get_wasabi_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member_unique_id: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      // 3. Check flag
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.bucket_key && data.bucket_secret && data.bucket_name) {
+          config.bucket = data.bucket_name;
+          // Ensure endpoint has protocol
+          let ep = data.bucket_endpoint;
+          if (ep && !ep.startsWith('http')) ep = `https://${ep}`;
+          
+          config.endpoint = ep;
+          config.region = data.bucket_region;
+          config.accessKeyId = data.bucket_key;
+          config.secretAccessKey = data.bucket_secret;
+        } else {
+          console.warn(`[Wasabi Auth] Private Label requested for ${memberUniqueId} but keys missing. Using default.`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Wasabi Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return config;
+}
+
+// Helper to create a client based on specific credentials
+function createS3Client(config) {
+  return new S3Client({
+    endpoint: config.endpoint,
+    region: config.region,
+    credentials: {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey
+    },
+    forcePathStyle: true
+  });
+}
+
+
+app.post('/upload', (req, res) => {
+  const form = new formidable.IncomingForm({
+    multiples: false,
+    uploadDir: UPLOAD_DIR,
+    keepExtensions: true,
+    maxFileSize: 2 * 1024 * 1024 * 1024
+  });
+
+  req.on('aborted', () => { /* ... */ });
+
+  form.parse(req, async (err, fields, files) => {
+    if (err) { /* ... handle error ... */ return; }
+    
+    try {
+      const uploaded = (files.file && files.file[0]) || files[Object.keys(files)[0]][0];
+      const { filepath, originalFilename, mimetype, size } = uploaded;
+      const timestamp = Date.now();
+      const safeName = originalFilename.replace(/[^\w.\-]/g, '_');
+
+      // 1. Extract Member ID
+      const memberUniqueId = Array.isArray(fields.member_unique_id) 
+        ? fields.member_unique_id[0] 
+        : fields.member_unique_id;
+
+      let result = {};
+      
+      if (isVideoOrAudio(mimetype)) {
+        // --- MUX LOGIC ---
+        const muxCreds = await getMuxCredentials(memberUniqueId);
+        result = await uploadToMux({ 
+          filepath, 
+          mimetype, 
+          originalFilename,
+          tokenId: muxCreds.id,
+          tokenSecret: muxCreds.secret
+        });
+      } else {
+        // --- WASABI LOGIC ---
+        const wasabiConfig = await getWasabiCredentials(memberUniqueId);
+        const wasabiKey = `${timestamp}_${safeName}`;
+        
+        // Pass the dynamic config
+        const url = await uploadToWasabi({ 
+          filepath, 
+          wasabiKey, 
+          mimetype, 
+          wasabiConfig 
+        });
+        result = { wasabi_url: url };
+      }
+
+      await fs.unlink(filepath).catch(() => { });
+
+      res.status(200).json({
+        ok: true,
+        filename: originalFilename,
+        mimetype,
+        size,
+        ...result
+      });
+    } catch (e) {
+      console.error('Upload error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+});
+
+///////////////////////////////////////////////////
+////////     Wasabi Presign Upload    /////////////
+///////////////////////////////////////////////////
+
+app.options('/wasabi_presign_upload', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  res.status(204).end();
+});
+
+app.post('/wasabi_presign_upload', express.json(), async (req, res) => {
+  // Extract member_unique_id from body
+  const { file_name, folder_structure, mimetype, member_unique_id } = req.body;
+  
+  if (!file_name || typeof file_name !== "string" || !folder_structure || typeof folder_structure !== "string") {
+    return res.status(400).json({ error: 'file_name and folder_structure required' });
+  }
+
+  // Get Dynamic Credentials
+  const wasabiConfig = await getWasabiCredentials(member_unique_id);
+  
+  // Create Dynamic Client
+  const client = createS3Client(wasabiConfig);
+
+  let folder = folder_structure.replace(/^\/+/, '');
+  if (folder && !folder.endsWith('/')) folder += '/';
+
+  const key = `${folder}${file_name}`;
+  const contentType = mimetype || 'application/octet-stream';
+
+  const command = new PutObjectCommand({
+    Bucket: wasabiConfig.bucket,
+    Key: key,
+    ContentType: contentType,
+    ACL: 'public-read'
+  });
+
+  try {
+    const uploadUrl = await getSignedUrl(client, command, { expiresIn: 300 });
+    
+    // Construct File URL dynamically based on the bucket used
+    const regionStr = wasabiConfig.region ? `.${wasabiConfig.region}` : '';
+    let fileUrl;
+    
+    if (wasabiConfig.endpoint.includes('wasabisys.com')) {
+       fileUrl = `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${key}`;
+    } else {
+       fileUrl = `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${key}`;
+    }
+
+    res.set('Access-Control-Allow-Origin', '*');
+    res.json({ uploadUrl, fileUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+///////////    Google Calendar    /////////////////
+///////////////////////////////////////////////////
+
+// ==== CONFIGURATION ====
+
+const CONFIG_GOOGLE_CALENDAR = {
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_CALENDAR_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'google_auth_state',
+  SCOPES: [
+    'https://www.googleapis.com/auth/calendar'
+  ]
+};
+
+// Helper: Get Dynamic Google Calendar Credentials & Domain
+async function getGoogleCalendarCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_CALENDAR.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_CALENDAR.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_CALENDAR.DEFAULT_DOMAIN}/login/google/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    // Note: Assuming the API endpoint follows the naming convention
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_calendar_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Calendar Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== STATE UTILS ====
+function generateStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_CALENDAR.TOKEN_EXPIRY });
+}
+function verifyStateToken(token) {
+  try {
+    // Returns { origin, memberUniqueId }
+    return jwt.verify(token, CONFIG_GOOGLE_CALENDAR.JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+// ==== LOGIN ENDPOINT ====
+app.get('/login/google/calendar', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Config to see where this user SHOULD be
+  const creds = await getGoogleCalendarCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google/calendar?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_GOOGLE_CALENDAR.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 5 * 60 * 1000 // 5 minutes
+  });
+
+  // 4. Create Dynamic OAuth Client
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: false,
+    scope: CONFIG_GOOGLE_CALENDAR.SCOPES
+  });
+  res.redirect(url);
+});
+
+// ==== CALLBACK ENDPOINT ====
+app.get('/login/google/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_CALENDAR.COOKIE_NAME];
+  
+  const decodedState = verifyStateToken(stateToken);
+  res.clearCookie(CONFIG_GOOGLE_CALENDAR.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials
+    const creds = await getGoogleCalendarCredentials(memberUniqueId);
+
+    // 2. Create Dynamic Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
+
+    const refresh_token = tokens.refresh_token || null;
+    const access_token = tokens.access_token || null;
+    const expires_in = tokens.expiry_date
+      ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+      : null;
+
+    const infoForJwt = {
+      refresh_token,
+      access_token,
+      expires_in
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_CALENDAR.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Calendar Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-calendar';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('googleCalendarRefreshToken', token);
+              localStorage.setItem('googleCalendarAuthOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ("" + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Calendar Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-calendar',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== TOKEN INFO VERIFICATION ENDPOINT ====
+app.get('/login/tokeninfo/calendar', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_CALENDAR.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      access_token: decoded.access_token,
+      expires_in: decoded.expires_in,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+///////////////////////////////////////////////////
+///////////    Outlook Calendar    ////////////////
+///////////////////////////////////////////////////
+
+const { AuthorizationCode } = require('simple-oauth2'); // USE THIS, not .create!
+
+const CONFIG_OUTLOOK_CALENDAR = {
+  CLIENT_ID: process.env.OUTLOOK_CALENDAR_CLIENT_ID,
+  CLIENT_SECRET: process.env.OUTLOOK_CALENDAR_CLIENT_SECRET,
+  REDIRECT_URI: `https://${process.env.COMPANION_DOMAIN}/login/outlook/callback`,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'outlook_auth_state',
+  COMPANION_DOMAIN: `https://${process.env.COMPANION_DOMAIN}`,
+  AUTHORITY: 'https://login.microsoftonline.com/common',
+  SCOPE: [
+    'openid',
+    'offline_access',
+    'profile',
+    'email',
+    'https://graph.microsoft.com/Calendars.ReadWrite'
+  ],
+};
+
+const outlookOauth2 = new AuthorizationCode({
+  client: {
+    id: CONFIG_OUTLOOK_CALENDAR.CLIENT_ID,
+    secret: CONFIG_OUTLOOK_CALENDAR.CLIENT_SECRET
+  },
+  auth: {
+    tokenHost: CONFIG_OUTLOOK_CALENDAR.AUTHORITY,
+    authorizePath: '/oauth2/v2.0/authorize',
+    tokenPath: '/oauth2/v2.0/token',
+  }
+});
+
+function generateOutlookStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET, { expiresIn: CONFIG_OUTLOOK_CALENDAR.TOKEN_EXPIRY });
+}
+function verifyOutlookStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET);
+    return decoded.origin;
+  } catch (err) {
+    return null;
+  }
+}
+
+app.get('/login/outlook/calendar', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateOutlookStateToken(origin);
+  res.cookie(CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 300000, // 5 min
+  });
+
+  const authorizationUri = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?` +
+    `response_type=code` +
+    `&client_id=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI)}` +
+    `&scope=${encodeURIComponent(CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '))}` +
+    `&prompt=consent`;
+
+  console.log("MS Authorize URI:", authorizationUri);
+  res.redirect(authorizationUri);
+});
+
+app.get('/login/outlook/callback', async (req, res) => {
+  const { code, error, error_description } = req.query;
+  const stateToken = req.cookies[CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyOutlookStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(CONFIG_OUTLOOK_CALENDAR.COOKIE_NAME);
+
+  if (error) {
+    const safeMsg = (error_description || error).replace(/'/g, "\\'");
+    return res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-outlook-calendar',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+
+  try {
+    // Exchange code for token
+    const formdata = new URLSearchParams({
+      client_id: CONFIG_OUTLOOK_CALENDAR.CLIENT_ID,
+      client_secret: CONFIG_OUTLOOK_CALENDAR.CLIENT_SECRET,
+      scope: CONFIG_OUTLOOK_CALENDAR.SCOPE.join(' '),
+      code: code,
+      redirect_uri: CONFIG_OUTLOOK_CALENDAR.REDIRECT_URI,
+      grant_type: 'authorization_code'
+    });
+
+    const tokenEndpoint = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
+    const fetchResp = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: formdata.toString()
+    });
+
+    // For raw debug:
+    const rawBody = await fetchResp.text();
+    console.log("MS token endpoint raw response:", rawBody);
+
+    let tokenObj = null;
+    try {
+      tokenObj = JSON.parse(rawBody);
+    } catch (e) {
+      // Microsoft error: not JSON
+      throw new Error("Token response was not JSON: " + rawBody.slice(0, 200));
+    }
+
+    if (tokenObj.error) {
+      throw new Error(`Token error: ${tokenObj.error} - ${tokenObj.error_description || ''}`);
+    }
+
+    // Now you have `tokenObj` as the parsed token JSON:
+    const token = tokenObj;
+
+    const refresh_token = token.refresh_token || null;
+    const refresh_token_expires_in = token.expires_in ? `${token.expires_in}` : null;
+
+    // Fetch user info from Microsoft Graph
+    let email = null, name = null, picture = null;
+    if (token.access_token) {
+      try {
+        const userResp = await fetch('https://graph.microsoft.com/v1.0/me', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer ' + token.access_token }
+        });
+        if (userResp.ok) {
+          const user = await userResp.json();
+          email = user.mail || user.userPrincipalName || null;
+          name = user.displayName || null;
+          try {
+            const picResp = await fetch('https://graph.microsoft.com/v1.0/me/photo/$value', {
+              headers: { Authorization: 'Bearer ' + token.access_token }
+            });
+            if (picResp.ok) {
+              const picBuf = await picResp.arrayBuffer();
+              const base64 = Buffer.from(picBuf).toString('base64');
+              picture = 'data:image/jpeg;base64,' + base64;
+            }
+          } catch (_) { }
+        }
+      } catch (e) { }
+    }
+
+    const infoForJwt = {
+      refresh_token,
+      refresh_token_expires_in,
+      email, name, picture,
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Outlook Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-outlook-calendar';
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+              localStorage.setItem('outlookCalendarRefreshToken', token);
+              localStorage.setItem('outlookCalendarAuthOrigin', targetOrigin);
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source, loginToken: token, status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4267B2; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    const safeMsg = ('' + err.message).replace(/'/g, "\\'");
+    console.error("Outlook oauth2 callback error:", err);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-outlook-calendar',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== CALENDAR TOKEN VERIFY ENDPOINT ====
+app.get('/login/tokeninfo/outlook', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_OUTLOOK_CALENDAR.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      refresh_token_expires_in: decoded.refresh_token_expires_in,
+      email: decoded.email,
+      name: decoded.name,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    console.error("Tokeninfo/outlook error:", err);
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+///////////////////////////////////////////////////
+////////////            Zoom        ///////////////
+///////////////////////////////////////////////////
+
+const CONFIG_ZOOM = {
+  // These serve as defaults
+  DEFAULT_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN, // e.g., services.upward.page
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'zoom_auth_state'
+};
+
+// Helper: Get Dynamic Zoom Credentials & Domain
+async function getZoomCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_ZOOM.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_ZOOM.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI based on env domain
+    redirectUri: `https://${CONFIG_ZOOM.DEFAULT_DOMAIN}/login/zoom/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_zoom_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.zoom_client_id && data.zoom_client_secret) {
+          credentials.clientId = data.zoom_client_id;
+          credentials.clientSecret = data.zoom_client_secret;
+        }
+        
+        // Check for dynamic domain
+        if (data.companion_domain) {
+           // Ensure no protocol is included in the DB field, or strip it if present
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/zoom/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Zoom Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// STATE TOKEN GENERATION/VERIFY
+function generateZoomStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_ZOOM.JWT_SECRET, { expiresIn: CONFIG_ZOOM.TOKEN_EXPIRY });
+}
+function verifyZoomStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_ZOOM.JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+// STEP 1: Start OAuth
+app.get('/login/zoom', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Credentials + Dynamic Redirect URI
+  const creds = await getZoomCredentials(member_unique_id);
+
+  // 2. Encode member_unique_id into state
+  const stateToken = generateZoomStateToken(origin, member_unique_id);
+
+  res.cookie(CONFIG_ZOOM.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 300000, // 5 min
+  });
+
+  const authorizeUrl = `https://zoom.us/oauth/authorize?` +
+    `response_type=code` +
+    `&client_id=${encodeURIComponent(creds.clientId)}` +
+    // USE THE DYNAMIC REDIRECT URI HERE
+    `&redirect_uri=${encodeURIComponent(creds.redirectUri)}` +
+    `&state=${encodeURIComponent(stateToken)}`;
+
+  res.redirect(authorizeUrl);
+});
+
+// STEP 2: OAuth2 Callback
+app.get('/login/zoom/callback', async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+  const cookieState = req.cookies[CONFIG_ZOOM.COOKIE_NAME];
+  
+  const decodedState = verifyZoomStateToken(cookieState);
+  res.clearCookie(CONFIG_ZOOM.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send('Missing or invalid state token');
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  // Verify returned state param
+  if (state) {
+    const checkState = verifyZoomStateToken(state);
+    if (!checkState || checkState.origin !== origin) {
+      return res.status(400).send('Invalid state parameter');
+    }
+  }
+
+  if (error) {
+    const safeMsg = (error_description || error).replace(/'/g, "\\'");
+    return res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-zoom-auth',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body><p>Authentication failed. Closing...</p></body>
+      </html>
+    `);
+  }
+
+  try {
+    // 1. Fetch Credentials + Dynamic Redirect URI again
+    const creds = await getZoomCredentials(memberUniqueId);
+
+    // 2. Exchange code for token
+    const tokenEndpoint = 'https://zoom.us/oauth/token';
+    const basicHeader = Buffer.from(`${creds.clientId}:${creds.clientSecret}`).toString('base64');
+
+    const tokenResp = await fetch(`${tokenEndpoint}?grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(creds.redirectUri)}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${basicHeader}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const tokenRaw = await tokenResp.text();
+    let tokenObj;
+    try { tokenObj = JSON.parse(tokenRaw); }
+    catch (e) { throw new Error("Token response was not JSON: " + tokenRaw.slice(0, 100)); }
+
+    if (tokenObj.error) {
+      throw new Error(`Token error: ${tokenObj.error} - ${tokenObj.reason || ''}`);
+    }
+
+    // Encrypt the refresh token using your Bubble API before storing it in the JWT
+    const raw_refresh_token = tokenObj.refresh_token || null;
+    let refresh_token = null;
+    if (raw_refresh_token) {
+      refresh_token = await encrypt(raw_refresh_token);
+    }
+    
+    const refresh_token_expires_in = tokenObj.refresh_token_expires_in || null;
+
+    // Fetch user info
+    let email = null, name = null, picture = null;
+    if (tokenObj.access_token) {
+      try {
+        const meResp = await fetch('https://api.zoom.us/v2/users/me', {
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + tokenObj.access_token }
+        });
+        if (meResp.ok) {
+          const meData = await meResp.json();
+          email = meData.email || null;
+          name = meData.first_name && meData.last_name ? (meData.first_name + ' ' + meData.last_name) : (meData.first_name || meData.last_name) || meData.id || null;
+          picture = meData.pic_url || null;
+        }
+      } catch (_) { }
+    }
+
+    const infoForJwt = {
+      refresh_token, refresh_token_expires_in, email, name, picture
+    };
+    const loginToken = jwt.sign(infoForJwt, CONFIG_ZOOM.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Zoom Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-zoom-auth';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('zoomRefreshToken', token);
+              localStorage.setItem('zoomAuthOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #2D8CFF; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (e) {
+    const safeMsg = ('' + e.message).replace(/'/g, "\\'");
+    console.error("Zoom oauth2 callback error:", e);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-zoom-auth',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body><p>Authentication failed. Closing window...</p></body>
+      </html>
+    `);
+  }
+});
+
+// 3. Verify JWT issued above
+app.get('/login/tokeninfo/zoom', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_ZOOM.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    
+    // The refresh_token returned here is the encrypted version returned by the Bubble API
+    res.json({
+      refresh_token: decoded.refresh_token,
+      refresh_token_expires_in: decoded.refresh_token_expires_in,
+      email: decoded.email,
+      name: decoded.name,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    console.error("Tokeninfo/zoom error:", err);
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+
+
+/////////////////////////////////////////////////////
+///////////     Google Analytics   /////////////////
+////////////////////////////////////////////////////
+
+const CONFIG_GOOGLE_ANALYTICS = {
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_ANALYTICS_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_ANALYTICS_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'google_analytics_auth_state',
+  SCOPES: [
+    "https://www.googleapis.com/auth/analytics.edit",
+    "https://www.googleapis.com/auth/analytics.readonly"
+  ]
+};
+
+// Helper: Get Dynamic Google Analytics Credentials & Domain
+async function getGoogleAnalyticsCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_ANALYTICS.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_ANALYTICS.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_ANALYTICS.DEFAULT_DOMAIN}/login/google-analytics/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_analytics_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google-analytics/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Analytics Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== STATE UTILS ====
+function generateAnalyticsStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_ANALYTICS.TOKEN_EXPIRY });
+}
+function verifyAnalyticsStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET);
+  } catch (e) {
+    return null;
+  }
+}
+
+// === OAUTH2 LOGIN ENDPOINT ===
+app.get('/login/google-analytics', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: "Origin parameter is required" });
+
+  // 1. Fetch Config
+  const creds = await getGoogleAnalyticsCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google-analytics?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateAnalyticsStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 5 * 60 * 1000 // 5 minutes
+  });
+
+  // 4. Create Dynamic OAuth Client
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: false,
+    scope: CONFIG_GOOGLE_ANALYTICS.SCOPES
+  });
+  res.redirect(url);
+});
+
+// === OAUTH2 CALLBACK ===
+app.get('/login/google-analytics/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME];
+  
+  const decodedState = verifyAnalyticsStateToken(stateToken);
+  res.clearCookie(CONFIG_GOOGLE_ANALYTICS.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials
+    const creds = await getGoogleAnalyticsCredentials(memberUniqueId);
+
+    // 2. Create Dynamic Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
+
+    const refresh_token = tokens.refresh_token || null;
+    const access_token = tokens.access_token || null;
+    const expires_in = tokens.expiry_date
+      ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+      : null;
+
+    const infoForJwt = {
+      refresh_token,
+      access_token,
+      expires_in
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Analytics Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-analytics';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('googleAnalyticsRefreshToken', token);
+              localStorage.setItem('googleAnalyticsAuthOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ("" + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Analytics Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-analytics',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// === TOKEN INFO VERIFICATION ENDPOINT ===
+app.get('/login/tokeninfo/analytics', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_ANALYTICS.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      access_token: decoded.access_token,
+      expires_in: decoded.expires_in,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+//////  IPX SERVER FOR IMAGE OPTIMIZATION  ////////
+///////////////////////////////////////////////////
+const ipx = createIPX({
+  httpStorage: ipxHttpStorage({
+    domains: [
+      "upward.s3.us-east-2.wasabisys.com",
+      "aa70287ff58ea68c3f5d2d6e98c40119.cdn.bubble.io",
+      "s3.us-east-2.wasabisys.com",
+      "1house.info"
+      // ,"another-allowed-remote-host.com"
+    ]
+    // You can also use a RegExp/string for wildcards if needed, but restrict as much as possible for security!
+  })
+});
+app.use('/ipx', createIPXNodeServer(ipx));
+
+
+///////////////////////////////////////////////////
+////////////    Google Meet Auth    ///////////////
+///////////////////////////////////////////////////
+
+const CONFIG_GOOGLE_MEET = {
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_MEET_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_MEET_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'google_meet_auth_state',
+  SCOPES: [
+    "https://www.googleapis.com/auth/meetings.space.created"
+  ]
+};
+
+// Helper: Get Dynamic Google Meet Credentials & Domain
+async function getGoogleMeetCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_MEET.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_MEET.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_MEET.DEFAULT_DOMAIN}/login/google/meet/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_meet_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google/meet/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Meet Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// TOKEN UTILS
+function generateMeetStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_MEET.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_MEET.TOKEN_EXPIRY });
+}
+function verifyMeetStateToken(token) {
+  try { return jwt.verify(token, CONFIG_GOOGLE_MEET.JWT_SECRET); } catch (err) { return null; }
+}
+
+// STEP 1: Start OAuth
+app.get('/login/google/meet', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Config to see where this user SHOULD be
+  const creds = await getGoogleMeetCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google/meet?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateMeetStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_GOOGLE_MEET.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 300000,
+  });
+
+  // 4. Create Dynamic OAuth Client just for URL generation
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: false,
+    scope: CONFIG_GOOGLE_MEET.SCOPES,
+    state: stateToken // Pass state in URL for verification later? Google handles this differently but usually returns what we send.
+    // However, we rely on the COOKIE for the state verification in our flow, 
+    // but Google sometimes requires state in the URL to pass it back to callback.
+    // We didn't use state param in previous Google implementation, relying on cookie. 
+    // We will stick to cookie but adding state param to URL is harmless standard practice.
+  });
+  
+  res.redirect(url);
+});
+
+// STEP 2: Callback
+app.get('/login/google/meet/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_MEET.COOKIE_NAME];
+  
+  const decodedState = verifyMeetStateToken(stateToken);
+  res.clearCookie(CONFIG_GOOGLE_MEET.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+     return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+  
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials (so we use the correct Client ID/Secret/RedirectURI)
+    const creds = await getGoogleMeetCredentials(memberUniqueId);
+
+    // 2. Create Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
+
+    const refresh_token = tokens.refresh_token || null;
+    const access_token = tokens.access_token || null;
+    const expires_in = tokens.expiry_date
+      ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+      : null;
+
+    const infoForJwt = {
+      refresh_token,
+      access_token,
+      expires_in
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_MEET.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Meet Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-meet';
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
+              localStorage.setItem('googleMeetRefreshToken', token);
+              localStorage.setItem('googleMeetAuthOrigin', targetOrigin);
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    console.error("Google Meet callback error:", error);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Meet Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-meet',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== MEET TOKEN VERIFY ENDPOINT ====
+app.get('/login/tokeninfo/meet', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_MEET.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      access_token: decoded.access_token,
+      expires_in: decoded.expires_in,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+///////////////////////////////////////////////////
+//      Google Login OAuth (profile only)        //
+///////////////////////////////////////////////////
+
+// ==== CONFIGURATION ====
+
+const CONFIG_GOOGLE_LOGIN = {
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_LOGIN_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_LOGIN_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET, 
+  TOKEN_EXPIRY: '2m',
+  COOKIE_NAME: 'google_login_state'
+};
+
+// Helper: Get Dynamic Google Login Credentials & Domain
+async function getGoogleLoginCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_LOGIN.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_LOGIN.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_LOGIN.DEFAULT_DOMAIN}/login/google/oauth/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_login_credentials", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google/oauth/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== UTILITY FUNCTIONS ====
+function generateLoginStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_LOGIN.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_LOGIN.TOKEN_EXPIRY });
+}
+function verifyLoginStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_GOOGLE_LOGIN.JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+// ==== LOGIN: GOOGLE OAUTH FOR PROFILE ====
+app.get('/login/google/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Config
+  const creds = await getGoogleLoginCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateLoginStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_GOOGLE_LOGIN.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 120000, // 2 min
+  });
+
+  // 4. Create Dynamic OAuth Client
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
+    access_type: 'online',
+    prompt: 'select_account',
+    include_granted_scopes: true,
+    scope: [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ],
+  });
+  res.redirect(url);
+});
+
+// ==== GOOGLE OAUTH2 CALLBACK (/login/google/oauth/callback)====
+app.get('/login/google/oauth/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_LOGIN.COOKIE_NAME];
+  
+  const decodedState = verifyLoginStateToken(stateToken);
+  res.clearCookie(CONFIG_GOOGLE_LOGIN.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials
+    const creds = await getGoogleLoginCredentials(memberUniqueId);
+
+    // 2. Create Dynamic Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
+    dynamicOauth2Client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({ version: 'v2', auth: dynamicOauth2Client });
+    const { data } = await oauth2.userinfo.get();
+
+    // Extract names (prefer given/family, fallback split)
+    let first_name = data.given_name, last_name = data.family_name;
+    if (!first_name || !last_name) {
+      if (data.name) {
+        const parts = data.name.trim().split(/\s+/);
+        first_name = parts[0];
+        last_name = parts.length > 1 ? parts.slice(1).join(' ') : '';
+      } else {
+        first_name = last_name = '';
+      }
+    }
+
+    const infoForJwt = {
+      first_name: first_name,
+      last_name: last_name,
+      email: data.email,
+      picture: data.picture
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_LOGIN.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_LOGIN.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google OAuth Login</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-login';
+
+            // Try postMessage to opener
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              // Fallback: localStorage
+              localStorage.setItem('googleLoginToken', token);
+              localStorage.setItem('googleLoginOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source, loginToken: token, status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    console.error("OAuth2 /oauth callback error:", error);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== TOKEN INFO ENDPOINT FOR /login/google/oauth TOKENS ====
+app.get('/login/tokeninfo/google', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_LOGIN.JWT_SECRET);
+
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    console.error("Tokeninfo/google error:", err);
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+///////////////////////////////////////////////////
+//      Facebook Login OAuth (profile only)      //
+///////////////////////////////////////////////////
+
+const CONFIG_FACEBOOK_LOGIN = {
+  DEFAULT_APP_ID: process.env.FACEBOOK_APP_ID,
+  DEFAULT_APP_SECRET: process.env.FACEBOOK_APP_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '2m',
+  COOKIE_NAME: 'facebook_login_state'
+};
+
+// Helper: Get Dynamic Facebook Login Credentials & Domain
+async function getFacebookLoginCredentials(memberUniqueId) {
+  let credentials = {
+    appId: CONFIG_FACEBOOK_LOGIN.DEFAULT_APP_ID,
+    appSecret: CONFIG_FACEBOOK_LOGIN.DEFAULT_APP_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_FACEBOOK_LOGIN.DEFAULT_DOMAIN}/login/facebook/oauth/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_login_credentials", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.app_id && data.app_secret) {
+          credentials.appId = data.app_id;
+          credentials.appSecret = data.app_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/facebook/oauth/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Facebook Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== State Token utils ====
+function generateFbLoginStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_FACEBOOK_LOGIN.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_LOGIN.TOKEN_EXPIRY });
+}
+function verifyFbLoginStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_FACEBOOK_LOGIN.JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+// ==== FACEBOOK LOGIN START ====
+app.get('/login/facebook/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Config
+  const creds = await getFacebookLoginCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/facebook/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateFbLoginStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_FACEBOOK_LOGIN.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 120000
+  });
+
+  const authUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(creds.appId)}`
+    + `&redirect_uri=${encodeURIComponent(creds.redirectUri)}`
+    + `&scope=email,public_profile`
+    + `&response_type=code`
+    + `&state=facebook-login`;
+
+  res.redirect(authUrl);
+});
+
+// ==== FACEBOOK OAUTH CALLBACK ====
+app.get('/login/facebook/oauth/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_FACEBOOK_LOGIN.COOKIE_NAME];
+  
+  const decodedState = verifyFbLoginStateToken(stateToken);
+  res.clearCookie(CONFIG_FACEBOOK_LOGIN.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials (to get correct app_id/secret/redirect_uri)
+    const creds = await getFacebookLoginCredentials(memberUniqueId);
+
+    // 2. Exchange code for access_token:
+    const accessResp = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
+      params: {
+        client_id: creds.appId,
+        client_secret: creds.appSecret,
+        redirect_uri: creds.redirectUri,
+        code
+      }
+    });
+    const access_token = accessResp.data.access_token;
+
+    // 3. Fetch user info
+    const userResp = await axios.get('https://graph.facebook.com/me', {
+      params: {
+        fields: 'id,first_name,last_name,email,picture.type(large)',
+        access_token
+      }
+    });
+    const user = userResp.data;
+
+    const infoForJwt = {
+      first_name: user.first_name || "",
+      last_name: user.last_name || "",
+      email: user.email || "",
+      picture: user.picture?.data?.url || ""
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_FACEBOOK_LOGIN.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_LOGIN.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Facebook OAuth Login</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-facebook-login';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('facebookLoginToken', token);
+              localStorage.setItem('facebookLoginOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+
+            window.addEventListener('beforeunload', function() {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                  source: source,
+                  loginToken: token,
+                  status: 'success'
+                }, targetOrigin);
+              }
+            });
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #1877f3; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-facebook-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== TOKEN INFO ENDPOINT FOR /login/facebook/oauth TOKENS ====
+app.get('/login/tokeninfo/facebook', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_FACEBOOK_LOGIN.JWT_SECRET);
+
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+///////////////////////////////////////////////////
+///   Apple Login OAuth (one-time profile only)  ///
+///////////////////////////////////////////////////
+
+// Config (set your Service ID and Companion domain)
+const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID;  // Your Service ID (ex: com.example.web)
+const APPLE_REDIRECT_URI = `https://${process.env.COMPANION_DOMAIN}/login/apple/callback`;
+const APPLE_JWT_SECRET = process.env.COMPANION_SECRET; // Use your app's JWT secret
+const APPLE_COOKIE_NAME = 'apple_login_state';
+
+// STATE HANDLING
+const TOKEN_EXPIRY = '2m';
+function generateAppleState(origin) {
+  return jwt.sign({ origin }, APPLE_JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+}
+function verifyAppleState(token) {
+  try {
+    const decoded = jwt.verify(token, APPLE_JWT_SECRET);
+    return decoded.origin;
+  } catch (e) { return null; }
+}
+
+// 1. Start Apple login
+app.get('/login/apple/oauth', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateAppleState(origin);
+  res.cookie(APPLE_COOKIE_NAME, stateToken, {
+    httpOnly: true, secure: true, sameSite: 'none', maxAge: 120000
+  });
+
+  const params = new URLSearchParams({
+    client_id: APPLE_CLIENT_ID,
+    redirect_uri: APPLE_REDIRECT_URI,
+    response_type: 'code id_token',
+    scope: 'name email',
+    response_mode: 'form_post',
+    state: 'apple-login'
+  });
+  res.redirect(`https://appleid.apple.com/auth/authorize?${params.toString()}`);
+});
+
+// 2. Apple callback (POST)
+app.post('/login/apple/callback', express.urlencoded({ extended: true }), (req, res) => {
+  // Apple will POST: code, id_token, state, user (only first sign-in)
+  const stateToken = req.cookies[APPLE_COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyAppleState(stateToken);
+  if (!origin) return res.status(400).send('Invalid state token');
+  res.clearCookie(APPLE_COOKIE_NAME);
+
+  // Extract user info
+  let first_name = "", last_name = "", email = "", picture = null;
+  if (req.body.user) {
+    try {
+      const userObj = JSON.parse(req.body.user);
+      first_name = userObj.name ? userObj.name.firstName : "";
+      last_name = userObj.name ? userObj.name.lastName : "";
+      email = userObj.email || "";
+    } catch (e) { }
+  }
+  // If not present, fallback: email from id_token
+  if (!email && req.body.id_token) {
+    try {
+      const decoded = JSON.parse(Buffer.from(req.body.id_token.split('.')[1], 'base64').toString());
+      email = decoded.email || "";
+    } catch (e) { }
+  }
+
+  const infoForJwt = {
+    first_name,
+    last_name,
+    email,
+    picture: null
+  };
+  const loginToken = jwt.sign(infoForJwt, APPLE_JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Apple OAuth Login</title>
+      <script>
+        (function() {
+          const token = '${loginToken}';
+          const targetOrigin = '${origin}';
+          const source = 'companion-apple-login';
+
+          if (window.opener && !window.opener.closed) {
+            window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
+            localStorage.setItem('appleLoginToken', token);
+            localStorage.setItem('appleLoginOrigin', targetOrigin);
+            setTimeout(() => window.close(), 100);
+          } else {
+            document.getElementById('auto-close').style.display = 'none';
+            document.getElementById('manual-close').style.display = 'block';
+          }
+          window.addEventListener('beforeunload', function() {
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({ source, loginToken: token, status: 'success' }, targetOrigin);
+            }
+          });
+        })();
+      </script>
+      <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+        #manual-close { display: none; margin-top: 20px; }
+        button { padding: 10px 20px; background: #000000; color: white; border: none; border-radius: 4px; cursor: pointer; }
+      </style>
+    </head>
+    <body>
+      <p id="auto-close">Authentication complete. Closing window...</p>
+      <div id="manual-close">
+        <p>Authentication complete. You may now close this window.</p>
+        <button onclick="window.close()">Close Window</button>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+// 3. Token verification endpoint
+app.get('/login/tokeninfo/apple', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+  try {
+    const decoded = jwt.verify(token, APPLE_JWT_SECRET);
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: null,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+//         LinkedIn Login OAuth (OpenID)         //
+///////////////////////////////////////////////////
+
+const CONFIG_LINKEDIN_LOGIN = {
+  DEFAULT_CLIENT_ID: process.env.LINKEDIN_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.LINKEDIN_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '2m',
+  COOKIE_NAME: 'linkedin_login_state'
+};
+
+// Helper: Get Dynamic LinkedIn Login Credentials & Domain
+async function getLinkedinLoginCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_LINKEDIN_LOGIN.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_LINKEDIN_LOGIN.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_LINKEDIN_LOGIN.DEFAULT_DOMAIN}/login/linkedin/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_linkedin_login_credentials", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/linkedin/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[LinkedIn Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== State Token Utils ====
+function generateLinkedinLoginStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_LINKEDIN_LOGIN.JWT_SECRET, { expiresIn: CONFIG_LINKEDIN_LOGIN.TOKEN_EXPIRY });
+}
+function verifyLinkedinLoginStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_LINKEDIN_LOGIN.JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+// ==== 1. Kick off login ====
+app.get('/login/linkedin/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Config
+  const creds = await getLinkedinLoginCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/linkedin/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate State & Set Cookie
+  const stateToken = generateLinkedinLoginStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_LINKEDIN_LOGIN.COOKIE_NAME, stateToken, {
+    httpOnly: true, secure: true, sameSite: 'none', maxAge: 120000
+  });
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: creds.clientId,
+    redirect_uri: creds.redirectUri,
+    state: 'linkedin-login', // LinkedIn requires this for CSRF, though we use cookie + JWT for our own verification
+    scope: 'openid email profile'
+  });
+
+  res.redirect('https://www.linkedin.com/oauth/v2/authorization?' + params.toString());
+});
+
+// ==== 2. Handle callback and POST to plugin ====
+app.get('/login/linkedin/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_LINKEDIN_LOGIN.COOKIE_NAME];
+  
+  const decodedState = verifyLinkedinLoginStateToken(stateToken);
+  res.clearCookie(CONFIG_LINKEDIN_LOGIN.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Credentials (to get correct client_id/secret/redirect_uri)
+    const creds = await getLinkedinLoginCredentials(memberUniqueId);
+
+    // 2. Exchange code for access_token & id_token
+    const tokenResp = await axios.post('https://www.linkedin.com/oauth/v2/accessToken', new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: creds.redirectUri,
+      client_id: creds.clientId,
+      client_secret: creds.clientSecret
+    }).toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+
+    const access_token = tokenResp.data.access_token;
+    const id_token = tokenResp.data.id_token;
+
+    // 3. Decode the id_token JWT for name/email/profile
+    let first_name = "", last_name = "", email = "", picture = null;
+    if (id_token) {
+      try {
+        // decode JWT
+        const payload = JSON.parse(Buffer.from(id_token.split('.')[1], 'base64').toString());
+        // LinkedIn OpenID typically gives these
+        first_name = payload.given_name || payload.name || "";
+        last_name = payload.family_name || "";
+        email = payload.email || payload.email_verified || "";
+        picture = payload.picture || null;
+        // Fallback: sometimes "sub" or other properties
+        if (!email && payload.sub) email = payload.sub;
+      } catch (e) { }
+    }
+
+    // If fallback, still get legacy info per old method:
+    if (!first_name || !last_name || !email) {
+      try {
+        const [profileResp, emailResp] = await Promise.all([
+          axios.get('https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,profilePicture(displayImage~:playableStreams))', {
+            headers: { Authorization: 'Bearer ' + access_token }
+          }),
+          axios.get('https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))', {
+            headers: { Authorization: 'Bearer ' + access_token }
+          })
+        ]);
+        const profile = profileResp.data;
+        email = (emailResp.data.elements[0]['handle~'] && emailResp.data.elements[0]['handle~'].emailAddress) || email;
+        first_name = profile.localizedFirstName || first_name;
+        last_name = profile.localizedLastName || last_name;
+
+        if (profile.profilePicture && profile.profilePicture['displayImage~'] && profile.profilePicture['displayImage~'].elements) {
+          const elementsArray = profile.profilePicture['displayImage~'].elements;
+          picture = elementsArray[elementsArray.length - 1].identifiers[0].identifier;
+        }
+      } catch { }
+    }
+
+    const infoForJwt = {
+      first_name: first_name || "",
+      last_name: last_name || "",
+      email: email || "",
+      picture: picture || null
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_LINKEDIN_LOGIN.JWT_SECRET, { expiresIn: CONFIG_LINKEDIN_LOGIN.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>LinkedIn OAuth Login</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-linkedin-login';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('linkedinLoginToken', token);
+              localStorage.setItem('linkedinLoginOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #0077b5; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>LinkedIn Auth Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-linkedin-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== 3. Verify JWT endpoint for plugin ====
+app.get('/login/tokeninfo/linkedin', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+  try {
+    const decoded = jwt.verify(token, CONFIG_LINKEDIN_LOGIN.JWT_SECRET);
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      picture: decoded.picture,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+///////////////////////////////////////////////////
+/////////    GOOGLE DRIVE PICKER    ///////////////
+///////////////////////////////////////////////////
+
+
+const CONFIG_GDRIVE_PICKER = {
+  CLIENT_ID:     '231297576692-c70ckvdglp7vtnamitq3h2ccrodkdi8a.apps.googleusercontent.com',      // format: XXXXXXXXXXXX-abc123.apps.googleusercontent.com
+  CLIENT_SECRET: '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',
+  JWT_SECRET:    'super_secret_change_me',
+  COMPANION_DOMAIN: 'services.upward.page',
+  COOKIE_NAME:   'gdrive_picker_state',
+  TOKEN_EXPIRY:  '3m',
+  SCOPE:         'https://www.googleapis.com/auth/drive.file'
+};
+
+const gdriveOauth2Client = new google.auth.OAuth2(
+  '231297576692-c70ckvdglp7vtnamitq3h2ccrodkdi8a.apps.googleusercontent.com',
+  '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',
+  `https://services.upward.page/login/gdrive_picker/callback`
+);
+
+function generateGDriveStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_GDRIVE_PICKER.JWT_SECRET, { expiresIn: CONFIG_GDRIVE_PICKER.TOKEN_EXPIRY });
+}
+function verifyGDriveStateToken(token) {
+  try {
+    const decoded = jwt.verify(token, CONFIG_GDRIVE_PICKER.JWT_SECRET);
+    return decoded.origin;
+  } catch (err) {
+    return null;
+  }
+}
+
+// --- 1. Start Google Drive Picker OAuth
+app.get('/login/gdrive_picker', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // Set state as signed JWT with origin
+  const stateToken = generateGDriveStateToken(origin);
+  res.cookie(CONFIG_GDRIVE_PICKER.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 3 * 60 * 1000 // 3 minutes
+  });
+
+  const url = gdriveOauth2Client.generateAuthUrl({
+    access_type: 'online',
+    prompt: 'select_account',
+    include_granted_scopes: false,
+    scope: [CONFIG_GDRIVE_PICKER.SCOPE]
+    // No need to set redirect_uri, set in client config above.
+  });
+
+  res.redirect(url);
+});
+
+// --- 2. OAuth2 callback
+app.get('/login/gdrive_picker/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GDRIVE_PICKER.COOKIE_NAME];
+  if (!stateToken) return res.status(400).send('Missing state token');
+  const origin = verifyGDriveStateToken(stateToken);
+  if (!origin) return res.status(400).send('Invalid or expired state token');
+  res.clearCookie(CONFIG_GDRIVE_PICKER.COOKIE_NAME);
+
+  try {
+    const { tokens } = await gdriveOauth2Client.getToken(code);
+    const access_token = tokens.access_token;
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Drive Auth</title>
+        <script>
+          (function() {
+            window.opener && window.opener.postMessage({
+              source: 'companion-google-login',
+              status: 'success',
+              access_token: '${access_token}'
+            }, '${origin}');
+            setTimeout(() => window.close(), 150);
+          })();
+        </script>
+      </head>
+      <body>
+        <p>Google Drive authentication complete. You may close this window.</p>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ("" + (error && error.message || error)).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Drive Auth Failed</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-login',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Google authentication failed. You may close this window.</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+
+///////////////////////////////////////////////////
+//////////    UNLAYER MUX UPLOAD    ///////////////
+///////////////////////////////////////////////////
+
+app.options('/unlayer_editor_mux_upload', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
+
+app.post('/unlayer_editor_mux_upload', async (req, res) => {
+  try {
+    const { filename, mimetype } = req.body || {};
+    if (!filename) return res.status(400).json({ error: "Missing filename" });
+    // Optionally validate file extension or mimetype
+
+    // 1. Create Mux Direct Upload (get upload URL and asset ID)
+    const external_id = randomUUID();
+
+    const response = await fetch('https://api.mux.com/video/v1/uploads', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')
+      },
+      body: JSON.stringify({
+        new_asset_settings: {
+          playback_policies: ['public'],
+          passthrough: filename,
+          meta: { external_id }
+        },
+        cors_origin: "*"
+      })
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`MUX upload create failed: ${response.status}: ${text}`);
+    }
+
+    const json = await response.json();
+    const { url: upload_url, id: upload_id } = json.data || {};
+
+    // 2. Respond with upload_url and id. Frontend should upload using a PUT to that URL.
+    res.status(200).json({
+      ok: true,
+      upload_url,
+      upload_id,
+      external_id
+    });
+  } catch (e) {
+    console.error('unlayer_editor_mux_upload error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// (Requires Mux Node SDK or fetch)
+app.get('/unlayer_mux_upload_status', async (req, res) => {
+  try {
+    const { upload_id } = req.query;
+    if (!upload_id) return res.status(400).json({ error: "Missing upload_id" });
+    // Query Mux Direct Uploads API to get the associated asset
+    const response = await fetch('https://api.mux.com/video/v1/uploads/' + upload_id, {
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')
+      }
+    });
+    if (!response.ok) throw new Error("Mux status error");
+    const data = await response.json();
+    const upload = data.data;
+    if (upload.asset_id) {
+      // now get the playback ID!
+      const assetResp = await fetch('https://api.mux.com/video/v1/assets/' + upload.asset_id, {
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64')
+        }
+      });
+      const assetData = await assetResp.json();
+      const asset = assetData.data;
+      if (asset.playback_ids && asset.playback_ids[0]) {
+        // Return the ready-to-play Mux "Playback URL!"
+        res.json({
+          playback_id: asset.playback_ids[0].id,
+          playback_url: `https://stream.mux.com/${asset.playback_ids[0].id}.m3u8`,
+          status: asset.status
+        });
+        return;
+      }
+    }
+    // Not ready yet
+    res.json({ status: upload.status });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+///////////         GPT        /////////////////
+///////////////////////////////////////////////////
+
+app.post("/gpt", async (req, res) => {
+  const { prompt, instructions } = req.body;
+  if (!prompt) return res.status(400).json({ error: "No prompt" });
+
+  // Build API payload
+  const payload = {
+    model: "gpt-4.1",
+    input: prompt,
+    tools: [{ type: "web_search_preview" }]
+  };
+  // Only add `instructions` if it exists
+  if (instructions) {
+    payload.instructions = instructions;
+  }
+
+  try {
+    const openaiRes = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + process.env.OPENAI_API_KEY
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await openaiRes.json();
+    // Find the "message" type output
+    const messageOutput = data.output?.find(item => item.type === "message");
+    // Find the content (text) in the message output
+    const outputText = messageOutput?.content?.find(c => c.type === "output_text")?.text || "";
+
+    res.json({ content: outputText });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+///////////////////////////////////////////////////
+///////////      MUX ASSET        /////////////////
+///////////////////////////////////////////////////
+
+app.put('/mux/assets/:asset_id/master-access', async (req, res) => {
+  const asset_id = req.params.asset_id;
+  const muxRes = await fetch(`https://api.mux.com/video/v1/assets/${asset_id}/master-access`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64'),
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(req.body)
+  });
+  const data = await muxRes.json();
+  res.json(data);
+});
+
+app.get('/mux/assets/:asset_id', async (req, res) => {
+  const asset_id = req.params.asset_id;
+  const muxRes = await fetch(`https://api.mux.com/video/v1/assets/${asset_id}`, {
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(`${MUX_TOKEN_ID}:${MUX_TOKEN_SECRET}`).toString('base64'),
+      'Accept': 'application/json'
+    }
+  });
+  const data = await muxRes.json();
+  res.json(data);
+});
+
+
+
+///////////////////////////////////////////////////
+///////////      DNS Records      /////////////////
+///////////////////////////////////////////////////
+
+app.get('/dns', async (req, res) => {
+  const { domain } = req.query;
+
+  if (!domain) {
+    return res.status(400).json({ error: 'Domain parameter is required' });
+  }
+
+  try {
+    // Perform lookups in parallel
+    const [a, aaaa, mx, txt, ns, cname, soa] = await Promise.allSettled([
+      dns.resolve4(domain).catch(() => null), // A Records
+      dns.resolve6(domain).catch(() => null), // AAAA Records
+      dns.resolveMx(domain).catch(() => null), // MX Records
+      dns.resolveTxt(domain).catch(() => null), // TXT Records
+      dns.resolveNs(domain).catch(() => null), // NS Records
+      dns.resolveCname(domain).catch(() => null), // CNAME Records
+      dns.resolveSoa(domain).catch(() => null)  // SOA Records
+    ]);
+
+    res.json({
+      domain,
+      records: {
+        A: a.value,
+        AAAA: aaaa.value,
+        MX: mx.value,
+        TXT: txt.value ? txt.value.flat() : null, // Flatten array of arrays
+        NS: ns.value,
+        CNAME: cname.value,
+        SOA: soa.value
+      }
+    });
+
+  } catch (error) {
+    // If the domain itself is invalid or completely unresolvable
+    res.status(500).json({ error: `DNS lookup failed: ${error.message}` });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+///////////      Request Headers  /////////////////
+///////////////////////////////////////////////////
+
+app.all('/debug/headers', (req, res) => {
+  // 1. Explicitly pull out all variables related to "where this came from"
+  const originInfo = {
+    exact_origin_header: req.headers.origin || "Not provided",
+    referer_header: req.headers.referer || req.headers.referrer || "Not provided",
+    host_header: req.headers.host || "Not provided",
+    express_ip: req.ip,
+    x_forwarded_for: req.headers['x-forwarded-for'] || "Not provided",
+    x_real_ip: req.headers['x-real-ip'] || "Not provided",
+    user_agent: req.headers['user-agent'] || "Not provided"
+  };
+
+  console.log('=== WHERE DID THIS COME FROM? ===');
+  console.log(JSON.stringify(originInfo, null, 2));
+  console.log('=== FULL INCOMING HEADERS ===');
+  console.log(JSON.stringify(req.headers, null, 2));
+  console.log('================================');
+
+  // 2. Send it back to the client
+  res.status(200).json({
+    ok: true,
+    message: 'If origin/referer are "Not provided", the client simply did not send them.',
+    where_it_came_from: originInfo,
+    all_raw_headers: req.headers
+  });
+});
+
+
+
+///////////////////////////////////////////////////
+//   Facebook Business Pages OAuth (CRM Setup)   //
+///////////////////////////////////////////////////
+
+const CONFIG_FACEBOOK_PAGES = {
+  DEFAULT_APP_ID: process.env.FACEBOOK_BUSINESS_APP_ID,
+  DEFAULT_APP_SECRET: process.env.FACEBOOK_BUSINESS_APP_SECRET,
+  DEFAULT_CONFIG_ID: process.env.FACEBOOK_BUSINESS_LOGIN_CONFIG_ID,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '15m', // 15 minutes allows users time to create a page mid-flow
+  COOKIE_NAME: 'facebook_pages_state'
+};
+
+// Helper: Get Dynamic Credentials & Domain specifically for the Pages route
+async function getFacebookPagesCredentials(memberUniqueId) {
+  let credentials = {
+    appId: CONFIG_FACEBOOK_PAGES.DEFAULT_APP_ID,
+    appSecret: CONFIG_FACEBOOK_PAGES.DEFAULT_APP_SECRET,
+    configId: CONFIG_FACEBOOK_PAGES.DEFAULT_CONFIG_ID,
+    redirectUri: `https://${CONFIG_FACEBOOK_PAGES.DEFAULT_DOMAIN}/login/facebook-pages/oauth/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_business_login_credentials", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.app_id && data.app_secret) {
+          credentials.appId = data.app_id;
+          credentials.appSecret = data.app_secret;
+        }
+        if (data.configuration_id) {
+          credentials.configId = data.configuration_id;
+        }
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/facebook-pages/oauth/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Facebook Pages Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== State Token utils ====
+function generateFbPagesStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_FACEBOOK_PAGES.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_PAGES.TOKEN_EXPIRY });
+}
+function verifyFbPagesStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_FACEBOOK_PAGES.JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+// ==== 1. FACEBOOK PAGES LOGIN START ====
+app.get('/login/facebook-pages/oauth', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const creds = await getFacebookPagesCredentials(member_unique_id);
+
+  if (!creds.configId) {
+      return res.status(500).json({ error: 'Missing configuration_id. Please ensure it is set in your environment variables or returned by the Bubble API.' });
+  }
+
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/facebook-pages/oauth?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  const stateToken = generateFbPagesStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_FACEBOOK_PAGES.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 900000 // 15 minutes
+  });
+
+  // v25.0 Graph API with config_id and passing state directly in the URL
+  const authUrl = `https://www.facebook.com/v25.0/dialog/oauth?client_id=${encodeURIComponent(creds.appId)}`
+    + `&redirect_uri=${encodeURIComponent(creds.redirectUri)}`
+    + `&config_id=${encodeURIComponent(creds.configId)}`
+    + `&response_type=code`
+    + `&state=${encodeURIComponent(stateToken)}`;
+
+  res.redirect(authUrl);
+});
+
+// ==== 2. FACEBOOK PAGES OAUTH CALLBACK ====
+app.get('/login/facebook-pages/oauth/callback', async (req, res) => {
+  const { code, state } = req.query;
+  // Fallback to URL state if cookie is blocked
+  const stateToken = req.cookies[CONFIG_FACEBOOK_PAGES.COOKIE_NAME] || state;
+  
+  const decodedState = verifyFbPagesStateToken(stateToken);
+  res.clearCookie(CONFIG_FACEBOOK_PAGES.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    const creds = await getFacebookPagesCredentials(memberUniqueId);
+
+    // Short-lived access token (v25.0)
+    const accessResp = await axios.get('https://graph.facebook.com/v25.0/oauth/access_token', {
+      params: {
+        client_id: creds.appId,
+        client_secret: creds.appSecret,
+        redirect_uri: creds.redirectUri,
+        code
+      }
+    });
+    let access_token = accessResp.data.access_token;
+
+    // Long-lived access token (v25.0)
+    const longLivedResp = await axios.get('https://graph.facebook.com/v25.0/oauth/access_token', {
+      params: {
+        grant_type: 'fb_exchange_token',
+        client_id: creds.appId,
+        client_secret: creds.appSecret,
+        fb_exchange_token: access_token
+      }
+    });
+    access_token = longLivedResp.data.access_token;
+
+    // Fetch Business Pages (v25.0)
+    const pagesResp = await axios.get('https://graph.facebook.com/v25.0/me/accounts', {
+      params: { access_token }
+    });
+    
+    const userPages = pagesResp.data.data.map(page => ({
+      page_id: page.id,
+      page_name: page.name,
+      page_access_token: page.access_token
+    }));
+
+    // PROGRAMMATIC WEBHOOK SUBSCRIPTION (CRITICAL FOR LIVE EVENTS)
+    for (const page of userPages) {
+      try {
+        await axios.post(`https://graph.facebook.com/v25.0/${page.page_id}/subscribed_apps`, null, {
+          params: {
+            subscribed_fields: 'feed',
+            access_token: page.page_access_token
+          }
+        });
+        console.log(`✅ Successfully subscribed webhook to Page: ${page.page_name}`);
+      } catch (err) {
+        console.error(`❌ Failed to subscribe webhook to Page: ${page.page_name}`, err.response?.data || err.message);
+      }
+    }
+
+    // Fetch user info (v25.0)
+    const userResp = await axios.get('https://graph.facebook.com/v25.0/me', {
+      params: { fields: 'id,first_name,last_name,email', access_token }
+    });
+    const user = userResp.data;
+
+    const infoForJwt = {
+      first_name: user.first_name || "",
+      last_name: user.last_name || "",
+      email: user.email || "",
+      facebook_user_id: user.id,
+      pages: userPages 
+    };
+
+    const loginToken = jwt.sign(infoForJwt, CONFIG_FACEBOOK_PAGES.JWT_SECRET, { expiresIn: CONFIG_FACEBOOK_PAGES.TOKEN_EXPIRY });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Facebook Pages Connection</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-facebook-pages'; 
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('facebookPagesToken', token);
+              localStorage.setItem('facebookPagesOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #1877f3; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Connection complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Connection complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ('' + (error.response?.data?.error?.message || error.message)).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Connection Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-facebook-pages',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== 3. TOKEN INFO ENDPOINT ====
+app.get('/login/tokeninfo/facebook-pages', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_FACEBOOK_PAGES.JWT_SECRET);
+    res.json({
+      first_name: decoded.first_name,
+      last_name: decoded.last_name,
+      email: decoded.email,
+      facebook_user_id: decoded.facebook_user_id,
+      pages: decoded.pages,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
+
+///////////////////////////////////////////////////
+//////    FACEBOOK PAGE WEBHOOKS (LEADS)    ///////
+///////////////////////////////////////////////////
+
+const crypto = require('crypto');
+
+const FACEBOOK_VERIFY_TOKEN = process.env.FACEBOOK_VERIFY_TOKEN || 'secure_upward_webhook_token_2026';
+const BUBBLE_WEBHOOK_RECEIVER = 'https://upward.page/api/1.1/wf/receive_facebook_lead';
+
+app.get('/webhooks/facebook', (req, res) => {
+  console.log('\n=== 🔵 INCOMING WEBHOOK VERIFICATION (GET) ===');
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  console.log(`Mode: ${mode}, Token: ${token}, Challenge: ${challenge}`);
+
+  if (mode && token) {
+    if (mode === 'subscribe' && token === FACEBOOK_VERIFY_TOKEN) {
+      console.log('✅ Facebook Webhook Verified Successfully');
+      return res.status(200).send(challenge);
+    } else {
+      console.error(`❌ Verification Failed. Expected Token: ${FACEBOOK_VERIFY_TOKEN}, Received: ${token}`);
+      return res.sendStatus(403);
+    }
+  }
+  return res.sendStatus(400);
+});
+
+app.post('/webhooks/facebook', async (req, res) => {
+  console.log('\n===================================================');
+  console.log('📬 NEW FACEBOOK WEBHOOK EVENT RECEIVED (POST)');
+  
+  const signature = req.headers['x-hub-signature-256'];
+  const fbAppSecret = process.env.FACEBOOK_BUSINESS_APP_SECRET; 
+
+  console.log('➡️ X-Hub-Signature-256:', signature || 'MISSING');
+
+  if (!signature || !fbAppSecret) {
+    console.error('❌ Missing Facebook Signature or App Secret');
+    return res.sendStatus(401);
+  }
+
+  const expectedSignature = 'sha256=' + crypto
+    .createHmac('sha256', fbAppSecret)
+    .update(req.rawBody)
+    .digest('hex');
+
+  if (signature !== expectedSignature) {
+    console.error('❌ Signature Validation Failed!');
+    console.error(`Expected: ${expectedSignature}`);
+    console.error(`Received: ${signature}`);
+    return res.sendStatus(403);
+  }
+
+  console.log('🔐 Signature validation successful!');
+
+  res.status(200).send('EVENT_RECEIVED');
+  console.log('✅ 200 OK EVENT_RECEIVED sent back to Meta');
+
+  const body = req.body;
+  
+  console.log('\n📦 FULL WEBHOOK PAYLOAD FROM META:');
+  console.log(JSON.stringify(body, null, 2));
+  console.log('---------------------------------------------------');
+
+  if (body.object === 'page') {
+    for (const entry of body.entry) {
+      const pageId = entry.id; 
+      console.log(`\n📄 Processing events for Page ID: ${pageId}`);
+
+      if (entry.changes) {
+        for (const change of entry.changes) {
+          console.log(`➡️ Found change on field: [${change.field}]`);
+          
+          if (change.field === 'feed') {
+            const eventData = change.value;
+            console.log(`   Item: ${eventData.item}, Verb: ${eventData.verb}`);
+
+            if (eventData.from) {
+              if (eventData.from.id === pageId) {
+                 console.log(`   ⏭️ Ignoring event: Action was performed by the Page itself.`);
+                 continue;
+              }
+
+              // Update: Meta v25 uses 'reaction' instead of 'like'
+              if (
+                (eventData.item === 'comment' && eventData.verb === 'add') ||
+                (eventData.item === 'reaction' && eventData.verb === 'add') ||
+                (eventData.item === 'share' && eventData.verb === 'add')
+              ) {
+                
+                const interactionString = eventData.item === 'reaction' ? eventData.reaction_type : eventData.item;
+                console.log(`   🎯 VALID LEAD TRIGGER: ${eventData.from.name} performed a ${interactionString}`);
+
+                // Dynamically build the direct Facebook link
+                let directUrl = `https://www.facebook.com/${pageId}`;
+                if (eventData.comment_id) {
+                    directUrl = `https://www.facebook.com/${eventData.comment_id}`;
+                } else if (eventData.post_id) {
+                    directUrl = `https://www.facebook.com/${eventData.post_id}`;
+                }
+
+                // If message is missing, provide a descriptive fallback
+                let defaultMessage = `User left a comment.`;
+                if (eventData.item === 'reaction') defaultMessage = `User reacted with a ${eventData.reaction_type}.`;
+                if (eventData.item === 'share') defaultMessage = `User shared a post.`;
+
+                const leadData = {
+                  page_id: pageId,
+                  lead_name: eventData.from.name,
+                  lead_facebook_id: eventData.from.id,
+                  message: eventData.message || defaultMessage, 
+                  post_id: eventData.post_id || null,
+                  comment_id: eventData.comment_id || null,
+                  facebook_url: directUrl, 
+                  interaction_type: interactionString, 
+                  timestamp: eventData.created_time
+                };
+
+                console.log('\n📤 PREPARING TO SEND TO BUBBLE:');
+                console.log(JSON.stringify(leadData, null, 2));
+
+                try {
+                  const bubbleResponse = await fetch(BUBBLE_WEBHOOK_RECEIVER, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
+                    },
+                    body: JSON.stringify(leadData)
+                  });
+
+                  if (!bubbleResponse.ok) {
+                    const errorText = await bubbleResponse.text();
+                    console.error(`\n❌ HTTP ERROR: Bubble rejected the request. Status: ${bubbleResponse.status}`);
+                    console.error(`Bubble Error Details: ${errorText}`);
+                  } else {
+                    const successData = await bubbleResponse.json();
+                    console.log(`\n🚀 SUCCESS! Bubble successfully received the lead.`);
+                    console.log(`Bubble Response:`, successData);
+                  }
+                } catch (error) {
+                  console.error('\n❌ NETWORK ERROR: Failed to communicate with Bubble API:', error.message);
+                }
+              } else {
+                console.log(`   ⏭️ Ignoring event: ${eventData.item}/${eventData.verb} does not match target triggers.`);
+              }
+            } else {
+               console.log(`   ⏭️ Ignoring event: No 'from' object found (Anonymous action).`);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    console.log(`⏭️ Ignoring webhook: Object type is '${body.object}', not 'page'.`);
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+///////////     iCal Generator    /////////////////
+///////////////////////////////////////////////////
+
+// Helper for DTSTAMP (Always needs to be current time in UTC)
+function getCurrentIcalUtc() {
+  return new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+}
+
+// Helper to keep the EXACT time passed from Bubble without any JS timezone shifting
+function formatExactLocalTime(dateString) {
+  // 1. Remove hyphens and colons
+  let cleaned = dateString.replace(/[-:]/g, '');
+  // 2. Remove decimals/milliseconds and the trailing 'Z' if present
+  cleaned = cleaned.split('.')[0].replace('Z', '');
+  return cleaned; // Returns exactly like: 20260529T090000
+}
+
+// ADVANCED HELPER: Convert HTML to plain text with proper spacing and link parsing
+function parseHtmlToPlain(html) {
+  if (!html) return '';
+
+  let text = html;
+
+  // 1. Format Hyperlinks (Now handles both quoted href="..." and unquoted href=...)
+  text = text.replace(/<a\s+[^>]*href\s*=\s*(?:["']([^"']+)["']|([^"'\s>]+))[^>]*>(.*?)<\/a>/gi, (match, quotedUrl, unquotedUrl, linkText) => {
+    // Pick whichever URL matched (quoted or unquoted)
+    const url = quotedUrl || unquotedUrl;
+    const cleanUrl = url.trim();
+    // Strip any nested tags inside the link text (like bold/italics) just in case
+    const cleanText = linkText.replace(/<[^>]+>/g, '').trim(); 
+    
+    // If the text is empty or exactly the same as the URL, just return the URL
+    if (!cleanText || cleanText === cleanUrl) {
+      return cleanUrl;
+    }
+    // Otherwise, return "Text: URL"
+    return `${cleanText}: ${cleanUrl}`;
+  });
+
+  // 2. Standard Formatting & Stripping
+  text = text
+    .replace(/\\n/g, '\n')                 // <--- ADDED THIS LINE: Converts literal '\n' strings to actual newlines
+    .replace(/\\r/g, '')                   // <--- ADDED THIS LINE: Cleans up literal carriage returns just in case
+    .replace(/<br\s*[\/]?>/gi, '\n')       // Convert <br> to newline
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n') // Convert paragraph breaks to double newline
+    .replace(/<\/p>/gi, '\n')              // End of paragraph to newline
+    .replace(/<p[^>]*>/gi, '')             // Remove opening paragraph tags (handles <p class="...">)
+    .replace(/<[^>]+>/g, '')               // Strip all remaining HTML tags (b, i, span, etc.)
+    .replace(/&nbsp;/g, ' ')               // Decode HTML spaces
+    .replace(/&amp;/g, '&')                // Decode ampersands
+    .replace(/&lt;/g, '<')                 // Decode <
+    .replace(/&gt;/g, '>')                 // Decode >
+    .replace(/\n\s*\n\s*\n/g, '\n\n')      // <--- ADDED THIS LINE: Prevents massive ugly gaps by capping at double newlines
+    .trim();                               // Clean up leading/trailing whitespace
+
+  return text;
+}
+
+
+// HELPER: Refine HTML for X-ALT-DESC strict formatting
+function refineHtmlForIcal(html) {
+  if (!html) return '';
+  
+  // 1. Convert newlines (\n) or literal string "\n" into <br> tags so HTML spacing works
+  let cleanHtml = html
+    .replace(/\\n/g, '<br>') // Handles literal '\n' string
+    .replace(/\n/g, '<br>')  // Handles actual newline characters
+    .replace(/\r/g, '');     // Removes carriage returns to keep iCal syntax valid
+    
+  return `<!DOCTYPE HTML><HTML><BODY>${cleanHtml}</BODY></HTML>`;
+}
+
+app.post('/generate_ical', async (req, res) => {
+  try {
+    const { 
+      title, 
+      description, 
+      start_time, 
+      end_time, 
+      organizer_name, 
+      organizer_email, 
+      attendee_name,
+      attendee_email,  
+      guests = [],     
+      location, 
+      member_unique_id,
+      booking_unique_id,
+      method = 'REQUEST', 
+      attendee_status = 'NEEDS-ACTION', 
+      sequence,
+      timezone_id, // e.g., "Asia/Tashkent"
+      version      // <--- ADD THIS: e.g., "version-test" or empty for live
+    } = req.body;
+
+    if (!title || !start_time || !end_time || !organizer_email || !booking_unique_id) {
+      return res.status(400).json({ error: "title, start_time, end_time, organizer_email, and booking_unique_id are required" });
+    }
+
+    const icalMethod = method.toUpperCase();
+    const icalStatus = icalMethod === 'CANCEL' ? 'CANCELLED' : 'CONFIRMED';
+    const icalSequence = sequence !== undefined ? sequence : (icalMethod === 'CANCEL' ? '1' : '0'); 
+    const partStat = attendee_status.toUpperCase();
+
+    // Process Descriptions
+    const descriptionPlainText = parseHtmlToPlain(description);
+    const descriptionHtml = refineHtmlForIcal(description);
+
+    // Build Attendees List
+    let attendeeLines = [];
+
+    if (attendee_email) {
+      const mainCnPrefix = attendee_name ? `;CN=${attendee_name}:` : ':';
+      attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=${partStat};RSVP=TRUE${mainCnPrefix}mailto:${attendee_email}`);
+    }
+
+    if (Array.isArray(guests) && guests.length > 0) {
+      guests.forEach(guest => {
+        if (guest.email) {
+          const guestCnPrefix = guest.name ? `;CN=${guest.name}:` : ':';
+          attendeeLines.push(`ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=${partStat};RSVP=TRUE${guestCnPrefix}mailto:${guest.email}`);
+        }
+      });
+    }
+
+    const dtStartLine = timezone_id 
+      ? `DTSTART;TZID=${timezone_id}:${formatExactLocalTime(start_time)}`
+      : `DTSTART:${formatExactLocalTime(start_time)}Z`; 
+      
+    const dtEndLine = timezone_id 
+      ? `DTEND;TZID=${timezone_id}:${formatExactLocalTime(end_time)}`
+      : `DTEND:${formatExactLocalTime(end_time)}Z`;
+
+    // ---> CREATE COMPOSITE UID WITH VERSION <---
+    // If a version is passed, append it. Otherwise, just use the booking ID.
+    const compositeUid = version ? `${booking_unique_id}__V__${version}` : booking_unique_id;
+
+    // Construct the iCal string
+    const icsContent = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//Upward//EN',
+      'CALSCALE:GREGORIAN',
+      `METHOD:${icalMethod}`, 
+      'BEGIN:VEVENT',
+      `UID:${compositeUid}`, // <--- USE THE COMPOSITE UID HERE
+      `DTSTAMP:${getCurrentIcalUtc()}`,
+      dtStartLine,
+      dtEndLine,
+      `SUMMARY:${title}`,
+      `DESCRIPTION:${descriptionPlainText.replace(/\n/g, '\\n')}`, 
+      `X-ALT-DESC;FMTTYPE=text/html:${descriptionHtml}`,           
+      location ? `LOCATION:${location}` : '',
+      `ORGANIZER;CN=${organizer_name}:mailto:${organizer_email}`,
+      ...attendeeLines, 
+      `STATUS:${icalStatus}`, 
+      `SEQUENCE:${icalSequence}`,
+      // --- ADDED 15 MINUTE REMINDER (VALARM) ---
+      'BEGIN:VALARM',
+      'ACTION:DISPLAY',
+      'DESCRIPTION:Reminder',
+      'TRIGGER:-PT15M',
+      'END:VALARM',
+      // -----------------------------------------
+      'END:VEVENT',
+      'END:VCALENDAR'
+    ].filter(Boolean).join('\r\n');
+
+    // Create Buffer and Upload
+    const buffer = Buffer.from(icsContent, 'utf-8');
+    const base64String = buffer.toString('base64');
+
+    // We can still use the normal booking_unique_id for the filename so it stays clean
+    const wasabiConfig = await getWasabiCredentials(member_unique_id);
+    const s3Client = createS3Client(wasabiConfig);
+    const wasabiKey = `icals/${Date.now()}_${booking_unique_id}.ics`;
+
+    const command = new PutObjectCommand({
+      Bucket: wasabiConfig.bucket,
+      Key: wasabiKey,
+      Body: buffer,
+      ContentType: 'text/calendar',
+      ACL: 'public-read'
+    });
+
+    await s3Client.send(command);
+
+    const regionStr = wasabiConfig.region ? `.${wasabiConfig.region}` : '';
+    let fileUrl = wasabiConfig.endpoint.includes('wasabisys.com') 
+      ? `https://${wasabiConfig.bucket}.s3${regionStr}.wasabisys.com/${wasabiKey}`
+      : `${wasabiConfig.endpoint}/${wasabiConfig.bucket}/${wasabiKey}`;
+
+    const linkStart = timezone_id ? formatExactLocalTime(start_time) : `${formatExactLocalTime(start_time)}Z`;
+    const linkEnd = timezone_id ? formatExactLocalTime(end_time) : `${formatExactLocalTime(end_time)}Z`;
+    const ctzParam = timezone_id ? `&ctz=${encodeURIComponent(timezone_id)}` : '';
+    const safeLoc = encodeURIComponent(location || '');
+    const safeTitle = encodeURIComponent(title || '');
+    const safeDesc = encodeURIComponent(descriptionPlainText || '');
+
+    const googleLink = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${safeTitle}&dates=${linkStart}/${linkEnd}&details=${safeDesc}&location=${safeLoc}${ctzParam}`;
+    const outlookLink = `https://outlook.live.com/calendar/0/deeplink/compose?path=/calendar/action/compose&rru=addevent&subject=${safeTitle}&startdt=${linkStart}&enddt=${linkEnd}&body=${safeDesc}&location=${safeLoc}`;
+    const yahooLink = `https://calendar.yahoo.com/?v=60&view=d&type=20&title=${safeTitle}&st=${linkStart}&et=${linkEnd}&desc=${safeDesc}&in_loc=${safeLoc}`;
+
+    res.status(200).json({
+      ok: true,
+      booking_unique_id: booking_unique_id,
+      method: icalMethod,
+      sequence: icalSequence,
+      file_url: fileUrl,
+      base64: base64String,
+      add_to_google_link: googleLink,
+      add_to_outlook_link: outlookLink,
+      add_to_yahoo_link: yahooLink,
+      description_plain_text: descriptionPlainText,
+      description_html: descriptionHtml
+    });
+
+  } catch (error) {
+    console.error('iCal Generation Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+///////////////////////////////////////////////////
+//////  SendGrid Inbound Parse (RSVP Webhook) /////
+///////////////////////////////////////////////////
+
+app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
+  res.status(200).send('OK'); 
+
+  const form = new formidable.IncomingForm({
+    multiples: true,
+    keepExtensions: true,
+  });
+
+  form.parse(req, async (err, fields, files) => {
+    if (err) {
+      console.error('Error parsing SendGrid webhook:', err);
+      return;
+    }
+
+    try {
+      console.log('=== INBOUND WEBHOOK FIRED ===');
+
+      let headerSenderEmail = '';
+      if (fields.from) {
+        const fromField = Array.isArray(fields.from) ? fields.from[0] : fields.from;
+        const emailMatch = fromField.match(/<([^>]+)>/) || fromField.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/);
+        headerSenderEmail = emailMatch ? emailMatch[1].trim().toLowerCase() : fromField.trim().toLowerCase();
+      }
+
+      let icsContent = null;
+      let filepathToCleanup = null;
+
+      for (const key of Object.keys(files)) {
+        const fileObj = Array.isArray(files[key]) ? files[key][0] : files[key];
+        const filename = (fileObj.originalFilename || '').toLowerCase();
+        const mimetype = (fileObj.mimetype || '').toLowerCase();
+
+        if (filename.endsWith('.ics') || filename.endsWith('.vcs') || mimetype.includes('calendar')) {
+          filepathToCleanup = fileObj.filepath;
+          icsContent = await fs.readFile(fileObj.filepath, 'utf8');
+          break;
+        }
+      }
+
+      if (!icsContent) {
+        for (const key of Object.keys(fields)) {
+          const val = Array.isArray(fields[key]) ? fields[key][0] : fields[key];
+          if (typeof val === 'string' && val.includes('BEGIN:VCALENDAR') && val.includes('UID:')) {
+            icsContent = val;
+            break;
+          }
+        }
+      }
+
+      if (!icsContent) {
+        console.log(`No iCal data found in email from ${headerSenderEmail}. Ignoring.`);
+        return;
+      }
+      
+      icsContent = icsContent.replace(/\r?\n[ \t]/g, '');
+
+      const uidMatch = icsContent.match(/UID:(.+)/i);
+      const partstatMatch = icsContent.match(/PARTSTAT=([A-Z-]+)/i);
+
+      if (!uidMatch || !partstatMatch) {
+        console.log(`Could not find UID or PARTSTAT in the reply from ${headerSenderEmail}.`);
+        if (filepathToCleanup) await fs.unlink(filepathToCleanup).catch(() => {});
+        return;
+      }
+
+      const rawUid = uidMatch[1].trim();
+      const status = partstatMatch[1].trim().toLowerCase();
+
+      // ---> PARSE VERSION FROM THE COMPOSITE UID <---
+      let unique_id = rawUid;
+      let targetVersion = "";
+
+      if (rawUid.includes('__V__')) {
+        const parts = rawUid.split('__V__');
+        unique_id = parts[0];
+        targetVersion = parts[1];
+      }
+
+      // 5. EXTRACT EMAIL AND NAME FROM iCAL DATA
+      let finalAttendeeEmail = headerSenderEmail;
+      let finalAttendeeName = ""; 
+      
+      const attendeeMatch = icsContent.match(/ATTENDEE.*?[mM][aA][iI][lL][tT][oO]:([^\s;]+)/i);
+      if (attendeeMatch && attendeeMatch[1]) {
+        finalAttendeeEmail = attendeeMatch[1].trim().toLowerCase().replace(/["']/g, '');
+      }
+
+      const cnMatch = icsContent.match(/CN=([^:;]+)/i);
+      if (cnMatch && cnMatch[1]) {
+        finalAttendeeName = cnMatch[1].trim();
+      }
+
+      console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | VERSION ${targetVersion || 'LIVE'} | EMAIL ${finalAttendeeEmail} <<<`);
+
+      // ---> DYNAMICALLY CONSTRUCT THE BUBBLE ENDPOINT <---
+      const BUBBLE_RSVP_ENDPOINT = targetVersion 
+        ? `https://upward.page/${targetVersion}/api/1.1/wf/update_ical_rsvp`
+        : `https://upward.page/api/1.1/wf/update_ical_rsvp`;
+      
+      await fetch(BUBBLE_RSVP_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          booking_unique_id: unique_id, 
+          status: status,
+          attendee_email: finalAttendeeEmail,
+          attendee_name: finalAttendeeName  
+        })
+      });
+
+      // 7. Cleanup
+      if (filepathToCleanup) {
+        await fs.unlink(filepathToCleanup).catch(() => {});
+      }
+
+    } catch (error) {
+      console.error('Error processing inbound RSVP:', error);
+    }
+  });
+});
+
+
+
+///////////////////////////////////////////////////
+///////////   Generate Website FAQs   /////////////
+///////////////////////////////////////////////////
+
+app.post('/api/generate-faqs', async (req, res) => {
+  const { scraped_text } = req.body;
+
+  if (!scraped_text) {
+    return res.status(400).json({ error: "Please provide scraped_text." });
+  }
+
+  // Build the OpenAI Responses API payload
+  const payload = {
+    model: "gpt-4o-mini",
+    input: [
+      {
+        role: "system",
+        content: "You are an expert knowledge-base architect. You will receive raw, scraped text from a company's website. Your job is to extract EVERY piece of useful information (what they do, pricing, features, target audience, policies, contact info) and formulate them into Frequently Asked Questions.\n\nCRITICAL FORMATTING RULES:\nYou MUST output the final result as a single continuous text string using EXACTLY these custom delimiters:\n- Use `#:#` to separate the Number, Title (Question), and Description (Answer).\n- Use `####` to separate each row (each FAQ).\n\nEXAMPLE FORMAT:\n1#:#What is your refund policy?#:#We offer a 30-day money back guarantee.####2#:#How much does the Pro plan cost?#:#The Pro plan is $49/month.\n\nDo not include any line breaks, extra spaces, or markdown outside of this exact format."
+      },
+      {
+        role: "user",
+        content: scraped_text
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "website_knowledge",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            faq_data: { 
+              type: "string", 
+              description: "The full list of FAQs formatted strictly with #:# and #### delimiters." 
+            }
+          },
+          required: ["faq_data"],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+
+  try {
+    const openaiRes = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + process.env.OPENAI_API_KEY
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!openaiRes.ok) {
+      const errorText = await openaiRes.text();
+      throw new Error(`OpenAI API Error: ${openaiRes.status} - ${errorText}`);
+    }
+
+    const data = await openaiRes.json();
+    
+    // Find the message output block
+    const messageOutput = data.output?.find(item => item.type === "message");
+    // Extract the raw stringified JSON text
+    const outputText = messageOutput?.content?.find(c => c.type === "output_text")?.text || "{}";
+    
+    // Parse the stringified JSON into a real JavaScript object
+    const parsedData = JSON.parse(outputText);
+
+    // Send the clean faq_data string straight back to Bubble
+    res.status(200).json({ 
+      success: true, 
+      faq_data: parsedData.faq_data || ""
+    });
+
+  } catch (error) {
+    console.error("FAQ Generation Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+///////////////////////////////////////////////////
+///////////         Server        /////////////////
+///////////////////////////////////////////////////
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+const PORT = process.env.PORT || 3020;
+const server = app.listen(PORT, () => {
+  console.log(`✅ Server running at port ${PORT}`);
+});
+
+companion.socket(server, options);
