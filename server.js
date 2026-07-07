@@ -3895,6 +3895,11 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         const parts = rawUid.split('__V__');
         unique_id = parts[0];
         targetVersion = parts[1];
+
+        if (targetVersion === 'null' || targetVersion === 'undefined') {
+          targetVersion = "";
+        }
+        
       }
 
       // 5. EXTRACT EMAIL AND NAME FROM iCAL DATA
