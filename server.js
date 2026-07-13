@@ -1281,7 +1281,7 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 //////    ZOOM WEBHOOKS (MEETING RECAPS)    ///////
 ///////////////////////////////////////////////////
 
-const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.COMPANION_SECRET;
+const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
 const BUBBLE_ZOOM_RECAP_RECEIVER = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recap';
 
 app.post('/webhooks/zoom', async (req, res) => {
