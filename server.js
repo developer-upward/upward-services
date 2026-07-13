@@ -1061,7 +1061,7 @@ function verifyZoomStateToken(token) {
 
 // STEP 1: Start OAuth
 app.get('/login/zoom', async (req, res) => {
-  const { origin, member_unique_id, recap } = req.query;
+  const { origin, member_unique_id } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
   // 1. Fetch Credentials + Dynamic Redirect URI
@@ -1077,23 +1077,17 @@ app.get('/login/zoom', async (req, res) => {
     maxAge: 300000, // 5 min
   });
 
-  // 3. Define Dynamic Scopes based on the 'recap' toggle parameter
-  let scopes = "meeting:write:meeting user:read"; // Basic Free Scopes
-  
-  if (recap === 'true') {
-    // Add additional premium scopes for paid users
-    scopes += " cloud_recording:read:recording:admin meeting:read:summary:admin";
-  }
-
+  // DO NOT pass the &scope parameter here. 
+  // Zoom will automatically use the exact scopes you checked in your dashboard.
   const authorizeUrl = `https://zoom.us/oauth/authorize?` +
     `response_type=code` +
     `&client_id=${encodeURIComponent(creds.clientId)}` +
     `&redirect_uri=${encodeURIComponent(creds.redirectUri)}` +
-    `&scope=${encodeURIComponent(scopes)}` + // <-- Pass dynamic scopes here
     `&state=${encodeURIComponent(stateToken)}`;
 
   res.redirect(authorizeUrl);
 });
+
 
 
 // STEP 2: OAuth2 Callback
