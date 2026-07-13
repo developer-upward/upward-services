@@ -1277,6 +1277,103 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
   }
 });
 
+///////////////////////////////////////////////////
+//////    ZOOM WEBHOOKS (MEETING RECAPS)    ///////
+///////////////////////////////////////////////////
+
+const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.COMPANION_SECRET;
+const BUBBLE_ZOOM_RECAP_RECEIVER = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recap';
+
+app.post('/webhooks/zoom', async (req, res) => {
+  console.log('\n===================================================');
+  console.log(' NEW ZOOM WEBHOOK EVENT RECEIVED (POST)');
+
+  const { event, payload } = req.body;
+
+  // 1. Handle Zoom's URL validation challenge (Mandatory for activation)
+  if (event === 'endpoint.url_validation') {
+    console.log(' Processing Zoom endpoint URL validation challenge...');
+    try {
+      const hashForValidate = crypto
+        .createHmac('sha256', ZOOM_WEBHOOK_SECRET_TOKEN)
+        .update(payload.plainToken)
+        .digest('hex');
+
+      return res.status(200).json({
+        plainToken: payload.plainToken,
+        encryptedToken: hashForValidate
+      });
+    } catch (err) {
+      console.error(' Failed to validate Zoom webhook endpoint:', err.message);
+      return res.sendStatus(500);
+    }
+  }
+
+  // 2. Process Zoom Events
+  res.status(200).send('EVENT_RECEIVED'); // Instantly respond to Zoom to prevent timeout retries
+
+  try {
+    let outboundPayload = null;
+
+    if (event === 'meeting.summary_completed') {
+      console.log(` Processing summary for Meeting ID: ${payload.object.meeting_id}`);
+      
+      outboundPayload = {
+        event_type: 'summary',
+        meeting_id: payload.object.meeting_id,
+        meeting_uuid: payload.object.meeting_uuid,
+        meeting_topic: payload.object.meeting_topic,
+        start_time: payload.object.start_time,
+        summary_content: payload.object.summary_content, // Sends AI recap/markdown content
+        summary_doc_url: payload.object.summary_doc_url || null
+      };
+    } 
+    
+    else if (event === 'recording.completed') {
+      console.log(` Processing recordings/transcripts for Meeting ID: ${payload.object.id}`);
+      
+      const recordingFiles = payload.object.recording_files || [];
+      const videoFile = recordingFiles.find(file => file.file_type === 'MP4');
+      const transcriptFile = recordingFiles.find(file => file.file_type === 'TRANSCRIPT');
+
+      outboundPayload = {
+        event_type: 'recording',
+        meeting_id: payload.object.id,
+        meeting_uuid: payload.object.uuid,
+        meeting_topic: payload.object.topic,
+        start_time: payload.object.start_time,
+        video_url: videoFile ? videoFile.download_url : null,
+        transcript_url: transcriptFile ? transcriptFile.download_url : null
+      };
+    }
+
+    // 3. Dispatch data to Bubble workflow if a target event was caught
+    if (outboundPayload) {
+      console.log('Sending processed Zoom payload to Bubble:', JSON.stringify(outboundPayload, null, 2));
+
+      const bubbleResponse = await fetch(BUBBLE_ZOOM_RECAP_RECEIVER, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+        },
+        body: JSON.stringify(outboundPayload)
+      });
+
+      if (!bubbleResponse.ok) {
+        const errorText = await bubbleResponse.text();
+        console.error(` Bubble error. Status: ${bubbleResponse.status}. Details: ${errorText}`);
+      } else {
+        console.log(' Success! Bubble received the Zoom recap/recording successfully.');
+      }
+    }
+
+  } catch (error) {
+    console.error(' Error handling Zoom webhook processing:', error.message);
+  }
+});
+
+
 
 
 
