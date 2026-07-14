@@ -1305,8 +1305,8 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 ///////////////////////////////////////////////////
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
-const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_summary/initialize';
-const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording/initialize'; 
+const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_summary';
+const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_recording';
 
 app.post('/webhooks/zoom', async (req, res) => {
   const { event, payload } = req.body;
@@ -1333,21 +1333,7 @@ app.post('/webhooks/zoom', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
 
   try {
-    const hostEmail = payload.object.host_email || payload.object.operator_email;
-
-    // A. Query your Bubble database to verify if this user has "Enable Recap" toggled ON
-    const checkUserResponse = await fetch(`https://upward.page/api/1.1/wf/check_user_tier?email=${encodeURIComponent(hostEmail)}`, {
-      headers: { 'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` }
-    });
-    
-    const userStatus = await checkUserResponse.json();
-
-    if (!userStatus.response || !userStatus.response.enable_recap) {
-      console.log(`[Paywall] Recap is disabled for ${hostEmail}. Discarding event.`);
-      return; 
-    }
-
-    // B. ROUTE EVENT 1: AI Summary Completed
+    // A. ROUTE EVENT 1: AI Summary Completed
     if (event === 'meeting.summary_completed') {
       console.log(`[Webhook Router] Directing Summary event to Bubble for Meeting ID: ${payload.object.meeting_id}`);
 
@@ -1360,7 +1346,7 @@ app.post('/webhooks/zoom', async (req, res) => {
         summary_doc_url: payload.object.summary_doc_url || null
       };
 
-      await fetch(BUBLE_SUMMARY_ENDPOINT, {
+      await fetch(BUBBLE_SUMMARY_ENDPOINT, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1370,7 +1356,7 @@ app.post('/webhooks/zoom', async (req, res) => {
       });
     } 
     
-    // C. ROUTE EVENT 2: Cloud Recording Completed
+    // B. ROUTE EVENT 2: Cloud Recording Completed
     else if (event === 'recording.completed') {
       console.log(`[Webhook Router] Directing Recording event to Bubble for Meeting ID: ${payload.object.id}`);
       
@@ -1401,9 +1387,6 @@ app.post('/webhooks/zoom', async (req, res) => {
     console.error('Error routing Zoom webhook events:', error.message);
   }
 });
-
-
-
 
 
 
