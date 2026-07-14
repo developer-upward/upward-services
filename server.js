@@ -1305,8 +1305,8 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 ///////////////////////////////////////////////////
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
-const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_summary';
-const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_recording';
+const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_summary/initialize';
+const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording/initialize';
 
 app.post('/webhooks/zoom', async (req, res) => {
   const { event, payload } = req.body;
