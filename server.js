@@ -4138,6 +4138,8 @@ app.post('/api/generate-faqs', async (req, res) => {
   }
 });
 
+
+
 ///////////////////////////////////////////////////
 ///////////    Coalias Route Copier   /////////////
 ///////////////////////////////////////////////////
@@ -4202,7 +4204,7 @@ app.post('/coalias/copy-routes', express.json(), async (req, res) => {
     const migrationResults = [];
 
     // 3. Process each batch, convert to CSV, and submit to Coalias bulk endpoint
-    for (let index = 0; i < batches.length; i++) {
+    for (let i = 0; i < batches.length; i++) {
       const currentBatch = batches[i];
       
       // Initialize CSV payload with headers
@@ -4255,6 +4257,7 @@ app.post('/coalias/copy-routes', express.json(), async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 
