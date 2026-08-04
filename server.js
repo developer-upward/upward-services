@@ -4138,6 +4138,125 @@ app.post('/api/generate-faqs', async (req, res) => {
   }
 });
 
+///////////////////////////////////////////////////
+///////////    Coalias Route Copier   /////////////
+///////////////////////////////////////////////////
+
+const COALIAS_API_KEY = process.env.COALIAS_API_KEY;
+
+app.post('/coalias/copy-routes', express.json(), async (req, res) => {
+  const { domain_to_copy_from, domain_to_copy_to } = req.body;
+
+  // Validate that both source and destination domains are provided
+  if (!domain_to_copy_from || !domain_to_copy_to) {
+    return res.status(400).json({ 
+      error: 'Both domain_to_copy_from and domain_to_copy_to parameters are required.' 
+    });
+  }
+
+  // Ensure authorization key is present in environment
+  if (!COALIAS_API_KEY) {
+    return res.status(500).json({ 
+      error: 'COALIAS_API_KEY is missing from the server environment configuration.' 
+    });
+  }
+
+  try {
+    console.log(`[Coalias] Fetching routes from source: ${domain_to_copy_from}`);
+
+    // 1. Fetch existing routes from the source domain
+    const getUrl = `https://api.coalias.com/domains/${encodeURIComponent(domain_to_copy_from)}/rules?type=routes`;
+    const getResponse = await fetch(getUrl, {
+      method: 'GET',
+      headers: {
+        'accept': 'application/json',
+        'Authorization': COALIAS_API_KEY
+      }
+    });
+
+    if (!getResponse.ok) {
+      const errorText = await getResponse.text();
+      throw new Error(`Failed to retrieve source routes (${getResponse.status}): ${errorText}`);
+    }
+
+    const sourceData = await getResponse.json();
+    const routesList = sourceData.list || [];
+
+    if (routesList.length === 0) {
+      return res.status(200).json({
+        ok: true,
+        message: 'No routes were found on the source domain to copy.',
+        copied_count: 0
+      });
+    }
+
+    console.log(`[Coalias] Found ${routesList.length} route(s). Processing batches...`);
+
+    // 2. Group routes into batches of maximum 10,000 entries
+    const BATCH_LIMIT = 10000;
+    const batches = [];
+    for (let i = 0; i < routesList.length; i += BATCH_LIMIT) {
+      batches.push(routesList.slice(i, i + BATCH_LIMIT));
+    }
+
+    const migrationResults = [];
+
+    // 3. Process each batch, convert to CSV, and submit to Coalias bulk endpoint
+    for (let index = 0; i < batches.length; i++) {
+      const currentBatch = batches[i];
+      
+      // Initialize CSV payload with headers
+      let csvContent = 'source,destination,type\n';
+      
+      currentBatch.forEach(route => {
+        const sourcePath = route.source || '';
+        const destinationPath = route.payload?.destination || '';
+        
+        // Escape quotes safely in paths for CSV format integrity
+        const escapedSource = sourcePath.replace(/"/g, '""');
+        const escapedDestination = destinationPath.replace(/"/g, '""');
+        
+        csvContent += `"${escapedSource}","${escapedDestination}",auto\n`;
+      });
+
+      console.log(`[Coalias] Sending batch ${i + 1}/${batches.length} containing ${currentBatch.length} routes.`);
+
+      const putUrl = `https://api.coalias.com/domains/${encodeURIComponent(domain_to_copy_to)}/rules/routes/bulk`;
+      const putResponse = await fetch(putUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'text/csv',
+          'Authorization': COALIAS_API_KEY
+        },
+        body: csvContent
+      });
+
+      const responseText = await putResponse.text();
+      
+      if (!putResponse.ok) {
+        throw new Error(`Failed to process bulk upload for batch ${i + 1} (${putResponse.status}): ${responseText}`);
+      }
+
+      try {
+        migrationResults.push(JSON.parse(responseText));
+      } catch (parseError) {
+        migrationResults.push({ message: responseText });
+      }
+    }
+
+    res.status(200).json({
+      ok: true,
+      message: `Successfully migrated ${routesList.length} route(s) across ${batches.length} batch(es).`,
+      details: migrationResults
+    });
+
+  } catch (error) {
+    console.error('[Coalias Copy Routes Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 
 
 
