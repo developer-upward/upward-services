@@ -4259,6 +4259,123 @@ app.post('/coalias/copy-routes', express.json(), async (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///////////   Coalias System Route Shift  /////////
+///////////////////////////////////////////////////
+
+app.post('/coalias/update-system-routes', express.json(), async (req, res) => {
+  const { domain_name, route } = req.body;
+
+  // Validate parameters
+  if (!domain_name || !route) {
+    return res.status(400).json({ 
+      error: 'Both domain_name and route (destination path) parameters are required.' 
+    });
+  }
+
+  // Ensure authorization key is present in environment
+  if (!COALIAS_API_KEY) {
+    return res.status(500).json({ 
+      error: 'COALIAS_API_KEY is missing from the server environment configuration.' 
+    });
+  }
+
+  try {
+    console.log(`[Coalias] Fetching all routes for: ${domain_name}`);
+
+    // 1. Fetch all routes for the specified domain
+    const getUrl = `https://api.coalias.com/domains/${encodeURIComponent(domain_name)}/rules?type=routes`;
+    const getResponse = await fetch(getUrl, {
+      method: 'GET',
+      headers: {
+        'accept': 'application/json',
+        'Authorization': COALIAS_API_KEY
+      }
+    });
+
+    if (!getResponse.ok) {
+      const errorText = await getResponse.text();
+      throw new Error(`Failed to retrieve rules (${getResponse.status}): ${errorText}`);
+    }
+
+    const sourceData = await getResponse.json();
+    const routesList = sourceData.list || [];
+
+    // 2. Filter for routes where the source path ends with "/system" (e.g., "/john/system")
+    const systemRoutes = routesList.filter(item => {
+      const source = item.source || '';
+      return source.endsWith('/system');
+    });
+
+    if (systemRoutes.length === 0) {
+      return res.status(200).json({
+        ok: true,
+        message: 'No system routes ending with "/system" were found to update.',
+        updated_count: 0
+      });
+    }
+
+    console.log(`[Coalias] Found ${systemRoutes.length} system route(s) to shift to destination: ${route}`);
+
+    // 3. Batch system routes in groups of 10,000 for safe bulk insertion
+    const BATCH_LIMIT = 10000;
+    const batches = [];
+    for (let i = 0; i < systemRoutes.length; i += BATCH_LIMIT) {
+      batches.push(systemRoutes.slice(i, i + BATCH_LIMIT));
+    }
+
+    const migrationResults = [];
+
+    // 4. Generate CSV and process the bulk uploads
+    for (let i = 0; i < batches.length; i++) {
+      const currentBatch = batches[i];
+      let csvContent = 'source,destination,type\n';
+
+      currentBatch.forEach(item => {
+        const sourcePath = item.source;
+        // Escape quotes safely in paths for CSV integrity
+        const escapedSource = sourcePath.replace(/"/g, '""');
+        const escapedDestination = route.replace(/"/g, '""');
+
+        csvContent += `"${escapedSource}","${escapedDestination}",auto\n`;
+      });
+
+      console.log(`[Coalias] Shifting batch ${i + 1}/${batches.length} containing ${currentBatch.length} routes.`);
+
+      const putUrl = `https://api.coalias.com/domains/${encodeURIComponent(domain_name)}/rules/routes/bulk`;
+      const putResponse = await fetch(putUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'text/csv',
+          'Authorization': COALIAS_API_KEY
+        },
+        body: csvContent
+      });
+
+      const responseText = await putResponse.text();
+      
+      if (!putResponse.ok) {
+        throw new Error(`Failed to bulk update system routes for batch ${i + 1} (${putResponse.status}): ${responseText}`);
+      }
+
+      try {
+        migrationResults.push(JSON.parse(responseText));
+      } catch (parseError) {
+        migrationResults.push({ message: responseText });
+      }
+    }
+
+    res.status(200).json({
+      ok: true,
+      message: `Successfully shifted ${systemRoutes.length} system route(s) to "${route}" across ${batches.length} batch(es).`,
+      details: migrationResults
+    });
+
+  } catch (error) {
+    console.error('[Coalias System Update Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 
 
