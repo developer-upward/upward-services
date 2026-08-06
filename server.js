@@ -1048,8 +1048,8 @@ async function getZoomCredentials(memberUniqueId, version) {
 }
 
 // STATE TOKEN GENERATION/VERIFY
-function generateZoomStateToken(origin, memberUniqueId) {
-  return jwt.sign({ origin, memberUniqueId }, CONFIG_ZOOM.JWT_SECRET, { expiresIn: CONFIG_ZOOM.TOKEN_EXPIRY });
+function generateZoomStateToken(origin, memberUniqueId, version) {
+  return jwt.sign({ origin, memberUniqueId, version }, CONFIG_ZOOM.JWT_SECRET, { expiresIn: CONFIG_ZOOM.TOKEN_EXPIRY });
 }
 function verifyZoomStateToken(token) {
   try {
@@ -1068,7 +1068,7 @@ app.get('/login/zoom', async (req, res) => {
   const creds = await getZoomCredentials(member_unique_id, version);
 
   // 2. Encode member_unique_id into state
-  const stateToken = generateZoomStateToken(origin, member_unique_id);
+  const stateToken = generateZoomStateToken(origin, member_unique_id, version);
 
   res.cookie(CONFIG_ZOOM.COOKIE_NAME, stateToken, {
     httpOnly: true,
@@ -1124,6 +1124,7 @@ app.get('/login/zoom/callback', async (req, res) => {
 
   const origin = decodedState.origin;
   const memberUniqueId = decodedState.memberUniqueId;
+  const version = decodedState.version;
 
   // Verify returned state param
   if (state) {
@@ -1155,7 +1156,7 @@ app.get('/login/zoom/callback', async (req, res) => {
 
   try {
     // 1. Fetch Credentials + Dynamic Redirect URI again
-    const creds = await getZoomCredentials(memberUniqueId);
+    const creds = await getZoomCredentials(memberUniqueId, version);
 
     // 2. Exchange code for token
     const tokenEndpoint = 'https://zoom.us/oauth/token';
