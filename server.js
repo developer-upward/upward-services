@@ -1013,8 +1013,13 @@ async function getZoomCredentials(memberUniqueId, version) {
 
   if (!memberUniqueId) return credentials;
 
+  var  = ""
+  if(version){
+    app_version = version;
+  }
+
   try {
-    const response = await fetch(`https://upward.page${version}/api/1.1/wf/get_zoom_credentials`, {
+    const response = await fetch(`https://upward.page${app_version}/api/1.1/wf/get_zoom_credentials`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ member: memberUniqueId })
