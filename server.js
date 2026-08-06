@@ -1003,7 +1003,7 @@ const CONFIG_ZOOM = {
 };
 
 // Helper: Get Dynamic Zoom Credentials & Domain
-async function getZoomCredentials(memberUniqueId) {
+async function getZoomCredentials(memberUniqueId, version) {
   let credentials = {
     clientId: CONFIG_ZOOM.DEFAULT_CLIENT_ID,
     clientSecret: CONFIG_ZOOM.DEFAULT_CLIENT_SECRET,
@@ -1014,7 +1014,7 @@ async function getZoomCredentials(memberUniqueId) {
   if (!memberUniqueId) return credentials;
 
   try {
-    const response = await fetch("https://upward.page/api/1.1/wf/get_zoom_credentials", {
+    const response = await fetch(`https://upward.page${version}/api/1.1/wf/get_zoom_credentials`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ member: memberUniqueId })
@@ -1061,11 +1061,11 @@ function verifyZoomStateToken(token) {
 
 // STEP 1: Start OAuth (Dynamic Scope Handler)
 app.get('/login/zoom', async (req, res) => {
-  const { origin, member_unique_id, recap } = req.query;
+  const { origin, member_unique_id, recap, version } = req.query;
   if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
 
   // 1. Fetch Credentials + Dynamic Redirect URI
-  const creds = await getZoomCredentials(member_unique_id);
+  const creds = await getZoomCredentials(member_unique_id, version);
 
   // 2. Encode member_unique_id into state
   const stateToken = generateZoomStateToken(origin, member_unique_id);
