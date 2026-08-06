@@ -1013,7 +1013,7 @@ async function getZoomCredentials(memberUniqueId, version) {
 
   if (!memberUniqueId) return credentials;
 
-  var  = ""
+  var app_version = ""
   if(version){
     app_version = version;
   }
