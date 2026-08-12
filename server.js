@@ -4391,25 +4391,24 @@ app.post('/coalias/update-system-routes', express.json(), async (req, res) => {
 const Holidays = require('date-holidays');
 
 /**
- * Endpoint to list all supported countries with their ISO codes and names.
- * URL: GET /api/countries
+ * Endpoint to list all supported countries and guess a default ISO based on the user's timezone.
+ * URL: GET /api/countries?user_timezone=Asia/Karachi
  */
 app.get('/api/countries', (req, res) => {
-  const { lang } = req.query; // Optional: ISO-639 language shortcode (e.g., 'en', 'es')
+  const { lang, user_timezone } = req.query;
   
   try {
     const hd = new Holidays();
     const countriesMap = hd.getCountries(lang || 'en');
     
-    // Transform the key-value pair map into a clean list of objects
+    // 1. Transform the map into a structured list
     const countriesList = Object.entries(countriesMap).map(([iso, name]) => {
-      // Fetch available states/provinces/regions for each country as additional info
       let states = null;
       try {
         const hdCountry = new Holidays(iso);
         states = hdCountry.getStates(iso);
       } catch (e) {
-        // Suppress errors for countries that might not support state retrieval
+        // Suppress errors for regions without state data
       }
 
       return {
@@ -4422,8 +4421,63 @@ app.get('/api/countries', (req, res) => {
       };
     });
 
+    // 2. Guess Default Country ISO from user_timezone parameter
+    let defaultCountryIso = 'US'; // Fallback default
+    
+    if (user_timezone) {
+      const tzMap = {
+        // North America
+        'America/New_York': 'US', 'America/Chicago': 'US', 'America/Denver': 'US', 'America/Los_Angeles': 'US',
+        'America/Phoenix': 'US', 'America/Anchorage': 'US', 'America/Honolulu': 'US',
+        'America/Toronto': 'CA', 'America/Vancouver': 'CA', 'America/Winnipeg': 'CA',
+        'America/Mexico_City': 'MX',
+        
+        // South Asia / Central Asia
+        'Asia/Karachi': 'PK', 'Asia/Kolkata': 'IN', 'Asia/Calcutta': 'IN', 'Asia/Dhaka': 'BD', 
+        'Asia/Colombo': 'LK', 'Asia/Kathmandu': 'NP', 'Asia/Kabul': 'AF', 'Asia/Tashkent': 'UZ',
+        
+        // Middle East
+        'Asia/Dubai': 'AE', 'Asia/Riyadh': 'SA', 'Asia/Baghdad': 'IQ', 'Asia/Tehran': 'IR',
+        'Asia/Jerusalem': 'IL', 'Asia/Beirut': 'LB', 'Asia/Amman': 'JO',
+        
+        // Europe
+        'Europe/London': 'GB', 'Europe/Dublin': 'IE', 'Europe/Paris': 'FR', 'Europe/Berlin': 'DE',
+        'Europe/Rome': 'IT', 'Europe/Madrid': 'ES', 'Europe/Amsterdam': 'NL', 'Europe/Brussels': 'BE',
+        'Europe/Vienna': 'AT', 'Europe/Zurich': 'CH', 'Europe/Stockholm': 'SE', 'Europe/Oslo': 'NO',
+        'Europe/Copenhagen': 'DK', 'Europe/Helsinki': 'FI', 'Europe/Athens': 'GR', 'Europe/Istanbul': 'TR',
+        'Europe/Kiev': 'UA', 'Europe/Moscow': 'RU',
+        
+        // East Asia / Southeast Asia
+        'Asia/Tokyo': 'JP', 'Asia/Seoul': 'KR', 'Asia/Shanghai': 'CN', 'Asia/Hong_Kong': 'HK',
+        'Asia/Singapore': 'SG', 'Asia/Bangkok': 'TH', 'Asia/Jakarta': 'ID', 'Asia/Manila': 'PH',
+        'Asia/Kuala_Lumpur': 'MY', 'Asia/Taipei': 'TW', 'Asia/Ho_Chi_Minh': 'VN',
+        
+        // Oceania
+        'Australia/Sydney': 'AU', 'Australia/Melbourne': 'AU', 'Australia/Brisbane': 'AU', 
+        'Australia/Perth': 'AU', 'Pacific/Auckland': 'NZ',
+        
+        // Africa / South America
+        'Africa/Johannesburg': 'ZA', 'Africa/Cairo': 'EG', 'Africa/Lagos': 'NG', 'Africa/Nairobi': 'KE',
+        'America/Sao_Paulo': 'BR', 'America/Argentina/Buenos_Aires': 'AR', 'America/Santiago': 'CL', 'America/Bogota': 'CO'
+      };
+
+      // Exact Match
+      if (tzMap[user_timezone]) {
+        defaultCountryIso = tzMap[user_timezone];
+      } else {
+        // Fallback: Try a prefix match on the zone identifier prefix (e.g. "Australia/" -> "AU")
+        const normalizedTz = user_timezone.toLowerCase();
+        if (normalizedTz.includes('australia')) defaultCountryIso = 'AU';
+        else if (normalizedTz.includes('argentina')) defaultCountryIso = 'AR';
+        else if (normalizedTz.includes('canada')) defaultCountryIso = 'CA';
+        else if (normalizedTz.includes('india')) defaultCountryIso = 'IN';
+        else if (normalizedTz.includes('london')) defaultCountryIso = 'GB';
+      }
+    }
+
     res.status(200).json({
       ok: true,
+      default_country_iso: defaultCountryIso,
       count: countriesList.length,
       countries: countriesList
     });
@@ -4434,56 +4488,120 @@ app.get('/api/countries', (req, res) => {
 });
 
 /**
- * Endpoint to fetch holiday dates for a specific country.
- * URL: GET /api/holidays?country=US&year=2026
+ * Endpoint to fetch next upcoming holiday occurrences, sorted chronologically.
+ * URL: GET /api/holidays?country=US&current_day=2026-08-12&user_timezone=Asia/Karachi
  */
 app.get('/api/holidays', (req, res) => {
-  const { country, year } = req.query;
+  const { country, current_day, user_timezone } = req.query;
 
   if (!country) {
-    return res.status(400).json({ error: 'The "country" query parameter is required (e.g., US, CA, GB).' });
+    return res.status(400).json({ error: 'The "country" query parameter is required (e.g., US).' });
   }
 
-  // Fallback to the current year if none is provided
-  const queryYear = year ? parseInt(year, 10) : new Date().getFullYear();
+  // Fallback to the current system date if current_day is not provided
+  const baseDateString = current_day || new Date().toISOString().split('T')[0];
+  const baseDate = new Date(baseDateString);
+  const currentYear = baseDate.getFullYear();
+  const tz = user_timezone || 'UTC';
 
   try {
-    const hd = new Holidays();
+    const hd = new Holidays(country.toUpperCase());
     
-    // Initialize the Holiday instance with the provided country code
-    const hdCountry = new Holidays(country.toUpperCase());
-    const holidays = hdCountry.getHolidays(queryYear);
+    // 1. Retrieve holidays for both the current year and the next year
+    const holidaysThisYear = hd.getHolidays(currentYear) || [];
+    const holidaysNextYear = hd.getHolidays(currentYear + 1) || [];
 
-    if (!holidays || holidays.length === 0) {
-      return res.status(404).json({ 
-        error: `No holidays found for country code "${country}" in year ${queryYear}.` 
+    // 2. Map holidays by name to track occurrences
+    const holidayMap = new Map();
+
+    holidaysThisYear.forEach(h => {
+      holidayMap.set(h.name, {
+        name: h.name,
+        thisYear: h,
+        nextYear: null
       });
+    });
+
+    holidaysNextYear.forEach(h => {
+      if (holidayMap.has(h.name)) {
+        holidayMap.get(h.name).nextYear = h;
+      } else {
+        holidayMap.set(h.name, {
+          name: h.name,
+          thisYear: null,
+          nextYear: h
+        });
+      }
+    });
+
+    const upcomingHolidays = [];
+    
+    // Normalize current day to midnight for clean comparison
+    const baseMidnight = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate()).getTime();
+
+    // 3. Determine if we should use this year's occurrence or next year's occurrence
+    for (const [name, occurrences] of holidayMap.entries()) {
+      let targetHoliday = null;
+
+      if (occurrences.thisYear) {
+        const holidayDate = new Date(occurrences.thisYear.start);
+        const holidayMidnight = new Date(holidayDate.getFullYear(), holidayDate.getMonth(), holidayDate.getDate()).getTime();
+
+        // If the holiday is today or in the future
+        if (holidayMidnight >= baseMidnight) {
+          targetHoliday = occurrences.thisYear;
+        }
+      }
+
+      // If it has already passed this year, use next year's date
+      if (!targetHoliday && occurrences.nextYear) {
+        targetHoliday = occurrences.nextYear;
+      }
+
+      if (targetHoliday) {
+        upcomingHolidays.push({
+          name: name,
+          raw_date: targetHoliday.start, // Date object
+          type: targetHoliday.type
+        });
+      }
     }
 
-    // Format holidays details for Bubble API digestion
-    const formattedHolidays = holidays.map(holiday => ({
-      date: holiday.date,             // String ISO date
-      start: holiday.start,           // Date Object start
-      end: holiday.end,               // Date Object end
-      name: holiday.name,             // Localized holiday name
-      type: holiday.type,             // Holiday type (public, bank, observance, etc.)
-      rule: holiday.rule              // Parser rule used
-    }));
+    // 4. Sort chronologically by the determined next occurrence date
+    upcomingHolidays.sort((a, b) => new Date(a.raw_date) - new Date(b.raw_date));
+
+    // 5. Format dates specifically matching the UI: "Next: MMM D, YYYY"
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: tz
+    });
+
+    const finalHolidaysList = upcomingHolidays.map(h => {
+      const formattedDate = formatter.format(new Date(h.raw_date));
+      return {
+        name: h.name,
+        next_occurrence: `Next: ${formattedDate}`,
+        raw_date: h.raw_date,
+        type: h.type
+      };
+    });
 
     res.status(200).json({
       ok: true,
       country: country.toUpperCase(),
-      year: queryYear,
-      count: formattedHolidays.length,
-      holidays: formattedHolidays
+      current_day: baseDateString,
+      user_timezone: tz,
+      count: finalHolidaysList.length,
+      holidays: finalHolidaysList
     });
+
   } catch (error) {
-    console.error(`Error fetching holidays for country ${country}:`, error);
+    console.error(`Error calculating upcoming holidays for ${country}:`, error);
     res.status(500).json({ error: error.message });
   }
 });
-
-
 
 
 
