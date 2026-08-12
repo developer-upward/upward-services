@@ -4488,7 +4488,8 @@ app.get('/api/countries', (req, res) => {
 });
 
 /**
- * Endpoint to fetch next upcoming holiday occurrences, sorted chronologically.
+ * Endpoint to fetch next upcoming holiday occurrences, sorted chronologically,
+ * with standard Timestamps compatible with Bubble.io Date fields.
  * URL: GET /api/holidays?country=US&current_day=2026-08-12&user_timezone=Asia/Karachi
  */
 app.get('/api/holidays', (req, res) => {
@@ -4561,7 +4562,7 @@ app.get('/api/holidays', (req, res) => {
       if (targetHoliday) {
         upcomingHolidays.push({
           name: name,
-          raw_date: targetHoliday.start, // Date object
+          raw_date: targetHoliday.start, // Date object or ISO string from package
           type: targetHoliday.type
         });
       }
@@ -4570,7 +4571,7 @@ app.get('/api/holidays', (req, res) => {
     // 4. Sort chronologically by the determined next occurrence date
     upcomingHolidays.sort((a, b) => new Date(a.raw_date) - new Date(b.raw_date));
 
-    // 5. Format dates specifically matching the UI: "Next: MMM D, YYYY"
+    // 5. Format dates for UI display ("Next: MMM D, YYYY") and Bubble-friendly formats
     const formatter = new Intl.DateTimeFormat('en-US', {
       month: 'short',
       day: 'numeric',
@@ -4579,11 +4580,15 @@ app.get('/api/holidays', (req, res) => {
     });
 
     const finalHolidaysList = upcomingHolidays.map(h => {
-      const formattedDate = formatter.format(new Date(h.raw_date));
+      const dateObj = new Date(h.raw_date);
+      const formattedDate = formatter.format(dateObj);
+      
       return {
         name: h.name,
         next_occurrence: `Next: ${formattedDate}`,
-        raw_date: h.raw_date,
+        // Bubble-friendly parameters:
+        timestamp_ms: dateObj.getTime(),               // Numerical timestamp (e.g. 1788757200000)
+        iso_date: dateObj.toISOString(),               // ISO 8601 String (e.g. "2026-09-07T00:00:00.000Z")
         type: h.type
       };
     });
@@ -4602,6 +4607,7 @@ app.get('/api/holidays', (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 
