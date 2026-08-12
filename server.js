@@ -4384,6 +4384,107 @@ app.post('/coalias/update-system-routes', express.json(), async (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///////////        HOLIDAYS API       /////////////
+///////////////////////////////////////////////////
+
+const Holidays = require('date-holidays');
+
+/**
+ * Endpoint to list all supported countries with their ISO codes and names.
+ * URL: GET /api/countries
+ */
+app.get('/api/countries', (req, res) => {
+  const { lang } = req.query; // Optional: ISO-639 language shortcode (e.g., 'en', 'es')
+  
+  try {
+    const hd = new Holidays();
+    const countriesMap = hd.getCountries(lang || 'en');
+    
+    // Transform the key-value pair map into a clean list of objects
+    const countriesList = Object.entries(countriesMap).map(([iso, name]) => {
+      // Fetch available states/provinces/regions for each country as additional info
+      let states = null;
+      try {
+        const hdCountry = new Holidays(iso);
+        states = hdCountry.getStates(iso);
+      } catch (e) {
+        // Suppress errors for countries that might not support state retrieval
+      }
+
+      return {
+        name,
+        iso,
+        states: states ? Object.entries(states).map(([stateCode, stateName]) => ({
+          code: stateCode,
+          name: stateName
+        })) : []
+      };
+    });
+
+    res.status(200).json({
+      ok: true,
+      count: countriesList.length,
+      countries: countriesList
+    });
+  } catch (error) {
+    console.error('Error fetching countries list:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Endpoint to fetch holiday dates for a specific country.
+ * URL: GET /api/holidays?country=US&year=2026
+ */
+app.get('/api/holidays', (req, res) => {
+  const { country, year } = req.query;
+
+  if (!country) {
+    return res.status(400).json({ error: 'The "country" query parameter is required (e.g., US, CA, GB).' });
+  }
+
+  // Fallback to the current year if none is provided
+  const queryYear = year ? parseInt(year, 10) : new Date().getFullYear();
+
+  try {
+    const hd = new Holidays();
+    
+    // Initialize the Holiday instance with the provided country code
+    const hdCountry = new Holidays(country.toUpperCase());
+    const holidays = hdCountry.getHolidays(queryYear);
+
+    if (!holidays || holidays.length === 0) {
+      return res.status(404).json({ 
+        error: `No holidays found for country code "${country}" in year ${queryYear}.` 
+      });
+    }
+
+    // Format holidays details for Bubble API digestion
+    const formattedHolidays = holidays.map(holiday => ({
+      date: holiday.date,             // String ISO date
+      start: holiday.start,           // Date Object start
+      end: holiday.end,               // Date Object end
+      name: holiday.name,             // Localized holiday name
+      type: holiday.type,             // Holiday type (public, bank, observance, etc.)
+      rule: holiday.rule              // Parser rule used
+    }));
+
+    res.status(200).json({
+      ok: true,
+      country: country.toUpperCase(),
+      year: queryYear,
+      count: formattedHolidays.length,
+      holidays: formattedHolidays
+    });
+  } catch (error) {
+    console.error(`Error fetching holidays for country ${country}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
 
 
 ///////////////////////////////////////////////////
