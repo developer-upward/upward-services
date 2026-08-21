@@ -1309,12 +1309,12 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 
 
 // ==========================================
-// ZOOM WEBHOOKS WITH RETRY LOGIC FOR 401 SYNC DELAYS
+// ZOOM WEBHOOKS WITH RETRY LOGIC & DYNAMIC FIELD MAPPING
 // ==========================================
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
-const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_summary';
-const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording';
+const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_summary';
+const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_recording';
 
 // Deduplication cache to prevent handling identical events twice
 const processedMeetingsCache = new Set();
@@ -1334,9 +1334,9 @@ async function axiosWithRetry(config, maxRetries = 4, delayMs = 5000) {
           `[Zoom Webhook] Got status ${status} (sync delay). Retrying in ${currentDelay / 1000}s... (Attempt ${attempt}/${maxRetries})`
         );
         await new Promise((resolve) => setTimeout(resolve, currentDelay));
-        currentDelay *= 1.5; // Exponential backoff (5s, then 7.5s, then 11.25s)
+        currentDelay *= 1.5; // Exponential backoff (5s, 7.5s, 11.25s)
       } else {
-        throw error; // Let other errors pass through, or throw on final attempt
+        throw error; // Throw on final attempt or if status is not 401/403
       }
     }
   }
@@ -1359,7 +1359,6 @@ function parseVttToJSON(vttText) {
 
     if (timeRegex.test(line)) {
       const startTime = line.split(' --> ')[0];
-      // Format time (e.g. 00:15:30.120 -> 15:30)
       const timeParts = startTime.split(':');
       let displayTime = '';
       if (timeParts.length === 3) {
@@ -1481,8 +1480,24 @@ app.post('/webhooks/zoom', async (req, res) => {
     const { event, payload } = req.body;
     if (!payload || !payload.object) return;
 
-    const meetingId = payload.object.id;
-    const meetingUuid = payload.object.uuid;
+    // --- Dynamic Field Mapping based on Event Type ---
+    let meetingId = '';
+    let meetingUuid = '';
+    let meetingTopic = '';
+    let startTime = '';
+
+    if (event === 'meeting.summary_completed') {
+      meetingId = payload.object.meeting_id;
+      meetingUuid = payload.object.meeting_uuid;
+      meetingTopic = payload.object.meeting_topic || '';
+      startTime = payload.object.meeting_start_time || '';
+    } else {
+      meetingId = payload.object.id;
+      meetingUuid = payload.object.uuid;
+      meetingTopic = payload.object.topic || '';
+      startTime = payload.object.start_time || '';
+    }
+
     const cacheKey = `${event}_${meetingId}`;
 
     // Deduplication check
@@ -1502,8 +1517,8 @@ app.post('/webhooks/zoom', async (req, res) => {
       const summaryPayload = {
         meeting_id: meetingId,
         meeting_uuid: meetingUuid,
-        meeting_topic: payload.object.topic,
-        start_time: payload.object.start_time,
+        meeting_topic: meetingTopic,
+        start_time: startTime,
         summary_content: payload.summary_content || '',
         summary_doc_url: payload.summary_doc_url || ''
       };
@@ -1526,8 +1541,13 @@ app.post('/webhooks/zoom', async (req, res) => {
       const videoFile = files.find((f) => f.file_type === 'MP4');
       const transcriptFile = files.find((f) => f.file_type === 'TRANSCRIPT');
 
-      // Correct extraction of download_token
-      const downloadToken = payload.download_token || req.body.payload?.download_token || '';
+      // Broad-spectrum search for download_token (Sibling, Payload level, or Nested object level)
+      const downloadToken = 
+        req.body.download_token || 
+        payload.download_token || 
+        req.body.payload?.download_token || 
+        payload.object?.download_token || 
+        '';
 
       if (!downloadToken) {
         console.error('[Webhook Router] Error: download_token was empty in the payload');
@@ -1543,7 +1563,7 @@ app.post('/webhooks/zoom', async (req, res) => {
           const muxResult = await streamZoomToMux({
             downloadUrl: videoFile.download_url,
             downloadToken,
-            originalFilename: `${payload.object.topic || 'zoom_recording'}_${meetingId}.mp4`,
+            originalFilename: `${meetingTopic || 'zoom_recording'}_${meetingId}.mp4`,
             hostEmail: payload.object.host_email
           });
           muxUploadId = muxResult?.upload_id || '';
@@ -1579,8 +1599,8 @@ app.post('/webhooks/zoom', async (req, res) => {
       const recordingPayload = {
         meeting_id: meetingId,
         meeting_uuid: meetingUuid,
-        meeting_topic: payload.object.topic,
-        start_time: payload.object.start_time,
+        meeting_topic: meetingTopic,
+        start_time: startTime,
         mux_upload_id: muxUploadId,
         transcript_json: transcriptJson
       };
