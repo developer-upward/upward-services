@@ -1372,27 +1372,34 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
   const tempPath = path.join(UPLOAD_DIR, tempFilename);
 
   try {
-    console.log(`[Zoom Mux] Intercepting redirected file path for ${originalFilename}...`);
+    console.log(`[Zoom Mux] Resolving secure redirect link for: ${originalFilename}`);
 
-    // 1. Resolve redirect location. We request with authorization header and capture the final location.
-    // We prevent standard auto-redirects because forwarding Authorization headers to CDNs triggers 401/403.
+    // Force Axios to completely stop at the 302 Redirect and NOT follow it automatically.
+    // This allows us to intercept the clean URL and strip our Zoom Bearer header.
     const redirectResponse = await axios({
       method: 'get',
       url: downloadUrl,
       headers: {
-        'Authorization': `Bearer ${downloadToken}`,
-        'Content-Type': 'application/json'
+        'Authorization': `Bearer ${downloadToken}`
       },
-      maxRedirects: 0,
-      validateStatus: (status) => status >= 200 && status < 400
+      maxRedirects: 0, // Stops automated Axios redirects
+      validateStatus: function (status) {
+        // Intercept 302 redirects without throwing an error
+        return status === 302 || (status >= 200 && status < 300);
+      }
     });
 
-    const finalDownloadUrl = redirectResponse.headers.location || downloadUrl;
+    // 1. Get the final, temporary AWS/CloudFront CDN download link
+    const finalDownloadUrl = redirectResponse.headers.location;
 
-    console.log(`[Zoom Mux] Streaming raw MP4 from resolved path to local storage: ${tempPath}`);
+    if (!finalDownloadUrl) {
+      throw new Error(`Failed to resolve the redirect URL. Status received: ${redirectResponse.status}`);
+    }
+
+    console.log(`[Zoom Mux] Streaming raw MP4 from AWS/CDN to temporary storage...`);
     const writer = fsSync.createWriteStream(tempPath);
     
-    // 2. Stream raw file from storage destination without authentication headers
+    // 2. Fetch the stream from the final URL WITHOUT any authorization headers
     const response = await axios({
       method: 'get',
       url: finalDownloadUrl,
@@ -1406,7 +1413,7 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
       writer.on('error', reject);
     });
 
-    // 3. Fetch credentials for the target host
+    // 3. Fetch credentials for Mux upload
     const muxCreds = await getMuxCredentials(hostEmail);
 
     console.log(`[Zoom Mux] Transferring localized binary to Mux...`);
@@ -1420,10 +1427,11 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
 
     return muxResult; 
   } finally {
-    // 4. Cleanup temporary file to preserve disk space
+    // 4. Clean up temporary local file
     await fs.unlink(tempPath).catch(() => {});
   }
 }
+
 
 app.post('/webhooks/zoom', async (req, res) => {
   const { event, payload } = req.body;
