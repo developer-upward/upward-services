@@ -1397,8 +1397,12 @@ function parseVttToJSON(vttText) {
  * Streams MP4 from Zoom, resolves CDN redirect, uploads to Mux, and cleans up
  */
 async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, hostEmail }) {
-  // Safe directory fallback: uses your existing UPLOAD_DIR if available, otherwise defaults to current folder
-  const tempDir = typeof UPLOAD_DIR !== 'undefined' ? UPLOAD_DIR : '.';
+  // Dynamically resolve the standard and promise-based fs modules to prevent import version conflicts
+  const fsSync = typeof require !== 'undefined' ? require('fs') : await import('fs');
+  const fsPromises = fsSync.promises || fsSync;
+
+  // Safe directory fallback: uses your existing UPLOAD_DIR if available, otherwise defaults to temporary folder
+  const tempDir = typeof UPLOAD_DIR !== 'undefined' ? UPLOAD_DIR : os.tmpdir();
   const uniqueId = Date.now() + '_' + Math.random().toString(36).substring(2, 11);
   const tempPath = path.join(tempDir, `zoom_${uniqueId}_temp.mp4`);
 
@@ -1427,7 +1431,7 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
     responseType: 'stream'
   });
 
-  const writer = fs.createWriteStream(tempPath);
+  const writer = fsSync.createWriteStream(tempPath);
   downloadRes.data.pipe(writer);
 
   await new Promise((resolve, reject) => {
@@ -1448,12 +1452,13 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
   });
 
   // 4️⃣ Clean up local temp file
-  await fs.promises.unlink(tempPath).catch((err) => {
+  await fsPromises.unlink(tempPath).catch((err) => {
     console.error(`[Zoom Mux] Failed to delete temp file ${tempPath}:`, err.message);
   });
 
   return uploadResult;
 }
+
 
 
 // ==========================================
