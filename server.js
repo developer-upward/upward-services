@@ -1314,8 +1314,11 @@ const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
 const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_summary';
 const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording';
 
+// In-memory cache to prevent concurrent duplicate webhooks from running in parallel
+const processedMeetingsCache = new Set();
+
 /**
- * Helper to Parse a standard Zoom WebVTT Transcript (.vtt) file into clean JSON structure.
+ * Helper to Parse a standard Zoom WebVTT Transcript (.vtt) file into a clean JSON structure.
  * Extracts timestamps, speaker names, and actual dialogue text blocks.
  */
 function parseVttToJSON(vttText) {
@@ -1323,7 +1326,7 @@ function parseVttToJSON(vttText) {
   const transcriptData = [];
   let currentEntry = null;
 
-  // Regex to detect VTT timecodes (e.g. 00:00:02.100 --> 00:00:07.500)
+  // Regex to detect standard VTT timecodes (e.g. 00:00:02.100 --> 00:00:07.500)
   const timeRegex = /^(\d{2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3}) -->/;
 
   for (let line of lines) {
@@ -1332,9 +1335,9 @@ function parseVttToJSON(vttText) {
 
     if (timeRegex.test(line)) {
       const parts = line.split(' --> ');
-      const rawTime = parts[0]; // e.g., "00:00:02.100" or "00:02.100"
+      const rawTime = parts[0]; 
       
-      // Clean time to readable "MM:SS" or "HH:MM:SS" format for front-end display
+      // Clean time to a readable "MM:SS" or "HH:MM:SS" format for the front-end display
       const shortTime = rawTime.split('.')[0].replace(/^00:/, ''); 
       
       currentEntry = { time: shortTime, rawTime: rawTime, speaker: 'Unknown', text: '' };
@@ -1360,21 +1363,39 @@ function parseVttToJSON(vttText) {
 }
 
 /**
- * Temp-streams Zoom recording to local storage, uploads to Mux, and cleans up.
+ * Streams the Zoom recording binary securely using Bearer download_token, 
+ * uploads to Mux, and cleans up the temporary local file afterwards.
  */
-async function streamZoomToMux({ zoomUrl, downloadToken, originalFilename, hostEmail }) {
-  const tempFilename = `zoom_${Date.now()}_temp.mp4`;
+async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, hostEmail }) {
+  const uniqueId = randomUUID();
+  const tempFilename = `zoom_${uniqueId}_temp.mp4`;
   const tempPath = path.join(UPLOAD_DIR, tempFilename);
 
   try {
-    // 1. Download Zoom MP4 to a temporary file on our server
-    console.log(`[Zoom Mux] Streaming raw MP4 from Zoom to temporary path: ${tempPath}`);
+    console.log(`[Zoom Mux] Intercepting redirected file path for ${originalFilename}...`);
+
+    // 1. Resolve redirect location. We request with authorization header and capture the final location.
+    // We prevent standard auto-redirects because forwarding Authorization headers to CDNs triggers 401/403.
+    const redirectResponse = await axios({
+      method: 'get',
+      url: downloadUrl,
+      headers: {
+        'Authorization': `Bearer ${downloadToken}`,
+        'Content-Type': 'application/json'
+      },
+      maxRedirects: 0,
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+
+    const finalDownloadUrl = redirectResponse.headers.location || downloadUrl;
+
+    console.log(`[Zoom Mux] Streaming raw MP4 from resolved path to local storage: ${tempPath}`);
     const writer = fsSync.createWriteStream(tempPath);
     
+    // 2. Stream raw file from storage destination without authentication headers
     const response = await axios({
       method: 'get',
-      url: zoomUrl,
-      headers: { 'Authorization': `Bearer ${downloadToken}` },
+      url: finalDownloadUrl,
       responseType: 'stream'
     });
 
@@ -1385,11 +1406,10 @@ async function streamZoomToMux({ zoomUrl, downloadToken, originalFilename, hostE
       writer.on('error', reject);
     });
 
-    // 2. Fetch the correct Mux credentials for this user context
+    // 3. Fetch credentials for the target host
     const muxCreds = await getMuxCredentials(hostEmail);
 
-    // 3. Upload the temporary local file to Mux using our existing helper
-    console.log(`[Zoom Mux] Direct-uploading file to Mux asset storage...`);
+    console.log(`[Zoom Mux] Transferring localized binary to Mux...`);
     const muxResult = await uploadToMux({
       filepath: tempPath,
       mimetype: 'video/mp4',
@@ -1398,9 +1418,9 @@ async function streamZoomToMux({ zoomUrl, downloadToken, originalFilename, hostE
       tokenSecret: muxCreds.secret
     });
 
-    return muxResult; // Returns { mux_upload_id, upload_url, external_id }
+    return muxResult; 
   } finally {
-    // 4. Ensure we clean up the temporary MP4 from our server
+    // 4. Cleanup temporary file to preserve disk space
     await fs.unlink(tempPath).catch(() => {});
   }
 }
@@ -1426,18 +1446,30 @@ app.post('/webhooks/zoom', async (req, res) => {
     }
   }
 
-  // 2. Instantly respond to Zoom to prevent webhook timeouts/retries
+  // 2. Instantly respond to Zoom to acknowledge receipt
   res.status(200).send('EVENT_RECEIVED');
 
   try {
     const hostEmail = payload.object.host_email || payload.object.operator_email || '';
+    const meetingId = payload.object.id || payload.object.meeting_id;
+    const cacheKey = `${event}_${meetingId}`;
 
-    // A. ROUTE EVENT 1: AI Summary Completed
+    // A. DEDUPLICATE PARALLEL TRIGGERS
+    if (processedMeetingsCache.has(cacheKey)) {
+      console.log(`[Webhook Router] Ignoring duplicate webhook trigger for key: ${cacheKey}`);
+      return;
+    }
+    
+    // Lock key in cache for 15 seconds to filter concurrent triggers
+    processedMeetingsCache.add(cacheKey);
+    setTimeout(() => processedMeetingsCache.delete(cacheKey), 15000);
+
+    // B. ROUTE EVENT 1: AI Summary Completed
     if (event === 'meeting.summary_completed') {
-      console.log(`[Webhook Router] Directing Summary event to Bubble for Meeting ID: ${payload.object.meeting_id}`);
+      console.log(`[Webhook Router] Processing Summary event for Meeting ID: ${meetingId}`);
 
       const summaryPayload = {
-        meeting_id: payload.object.meeting_id,
+        meeting_id: meetingId,
         meeting_uuid: payload.object.meeting_uuid,
         meeting_topic: payload.object.meeting_topic,
         start_time: payload.object.start_time,
@@ -1453,36 +1485,34 @@ app.post('/webhooks/zoom', async (req, res) => {
         },
         body: JSON.stringify(summaryPayload)
       });
+      console.log(`[Webhook Router] Summary sent to Bubble successfully.`);
     } 
     
-    // B. ROUTE EVENT 2: Cloud Recording Completed
+    // C. ROUTE EVENT 2: Cloud Recording Completed
     else if (event === 'recording.completed') {
-      const meetingId = payload.object.id;
       console.log(`[Webhook Router] Processing Recording event for Meeting ID: ${meetingId}`);
       
       const recordingFiles = payload.object.recording_files || [];
       const videoFile = recordingFiles.find(file => file.file_type === 'MP4');
       const transcriptFile = recordingFiles.find(file => file.file_type === 'TRANSCRIPT');
 
-      // Ensure we have files to process
       if (!videoFile && !transcriptFile) {
         console.warn(`[Webhook Router] No MP4 or VTT files found inside payload for Meeting ${meetingId}. Skipping.`);
         return;
       }
 
-      // Zoom provides the temporary download_token in the webhook payload
-      const downloadToken = payload.download_token || '';
+      // Extract token correctly from req.body.payload.download_token
+      const downloadToken = payload.download_token || (req.body.payload ? req.body.payload.download_token : '');
 
       let muxUploadId = null;
       let parsedTranscriptJson = '[]';
 
-      // Step 1: Upload raw MP4 recording to MUX
+      // 1. Process Video File
       if (videoFile) {
-        console.log(`[Webhook Router] Starting transfer process from Zoom to Mux...`);
         const originalFilename = `${payload.object.topic || 'Zoom_Meeting'}_${meetingId}.mp4`;
         
         const muxUploadData = await streamZoomToMux({
-          zoomUrl: videoFile.download_url,
+          downloadUrl: videoFile.download_url,
           downloadToken: downloadToken,
           originalFilename: originalFilename,
           hostEmail: hostEmail
@@ -1492,38 +1522,44 @@ app.post('/webhooks/zoom', async (req, res) => {
         console.log(`[Webhook Router] Mux Direct Upload initiated with ID: ${muxUploadId}`);
       }
 
-      // Step 2: Download & Parse VTT Transcript File to Structured JSON
+      // 2. Process and Parse VTT Transcript File
       if (transcriptFile) {
-        console.log(`[Webhook Router] Downloading VTT Transcript for Parsing...`);
+        console.log(`[Webhook Router] Fetching VTT transcript for processing...`);
         
-        const vttResponse = await axios.get(transcriptFile.download_url, {
+        // Resolve manual redirect for the VTT transcript as well
+        const redirectVttResponse = await axios({
+          method: 'get',
+          url: transcriptFile.download_url,
           headers: {
-            'Authorization': `Bearer ${downloadToken}`
-          }
+            'Authorization': `Bearer ${downloadToken}`,
+            'Content-Type': 'application/json'
+          },
+          maxRedirects: 0,
+          validateStatus: (status) => status >= 200 && status < 400
         });
+
+        const finalVttUrl = redirectVttResponse.headers.location || transcriptFile.download_url;
+
+        const vttResponse = await axios.get(finalVttUrl);
 
         if (vttResponse.status === 200 && vttResponse.data) {
           const parsedLines = parseVttToJSON(vttResponse.data);
           parsedTranscriptJson = JSON.stringify(parsedLines);
-          console.log(`[Webhook Router] Transcript successfully parsed: ${parsedLines.length} dialogues extracted.`);
+          console.log(`[Webhook Router] VTT Transcript parsed: ${parsedLines.length} dialogues extracted.`);
         }
       }
 
-
-      parsedTranscriptJson = JSON.stringify(parsedLines);
-
-      // Step 3: Dispatch data payload to Bubble
-      // Pass the mux_upload_id so Bubble can poll the status endpoint or register a Mux Webhook listener
+      // 3. Dispatch structured payload to Bubble
       const recordingPayload = {
         meeting_id: meetingId,
         meeting_uuid: payload.object.uuid,
         meeting_topic: payload.object.topic,
         start_time: payload.object.start_time,
-        mux_upload_id: muxUploadId, // Use this in Bubble to query playback status / URLs
-        transcript_json: parsedTranscriptJson // Send parsed interactive transcript
+        mux_upload_id: muxUploadId,
+        transcript_json: parsedTranscriptJson
       };
 
-      await fetch(BUBBLE_RECORDING_ENDPOINT, {
+      const bubbleResponse = await fetch(BUBBLE_RECORDING_ENDPOINT, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1531,13 +1567,20 @@ app.post('/webhooks/zoom', async (req, res) => {
         },
         body: JSON.stringify(recordingPayload)
       });
-      console.log(`[Webhook Router] Successfully dispatched parsed Mux-recording payload to Bubble.`);
+
+      if (!bubbleResponse.ok) {
+        const errorText = await bubbleResponse.text();
+        console.error(`[Webhook Router] Bubble rejected recording payload: ${bubbleResponse.status} - ${errorText}`);
+      } else {
+        console.log(`[Webhook Router] Successfully dispatched parsed Mux-recording payload to Bubble.`);
+      }
     }
 
   } catch (error) {
     console.error('Error routing Zoom webhook events:', error.message);
   }
 });
+
 
 
 
