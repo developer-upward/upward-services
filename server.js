@@ -1509,6 +1509,9 @@ app.post('/webhooks/zoom', async (req, res) => {
         }
       }
 
+
+      parsedTranscriptJson = JSON.stringify(parsedLines);
+
       // Step 3: Dispatch data payload to Bubble
       // Pass the mux_upload_id so Bubble can poll the status endpoint or register a Mux Webhook listener
       const recordingPayload = {
