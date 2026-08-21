@@ -1397,7 +1397,10 @@ function parseVttToJSON(vttText) {
  * Streams MP4 from Zoom, resolves CDN redirect, uploads to Mux, and cleans up
  */
 async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, hostEmail }) {
-  const tempPath = path.join(os.tmpdir(), `zoom_${crypto.randomUUID()}_temp.mp4`);
+  // Safe directory fallback: uses your existing UPLOAD_DIR if available, otherwise defaults to current folder
+  const tempDir = typeof UPLOAD_DIR !== 'undefined' ? UPLOAD_DIR : '.';
+  const uniqueId = Date.now() + '_' + Math.random().toString(36).substring(2, 11);
+  const tempPath = path.join(tempDir, `zoom_${uniqueId}_temp.mp4`);
 
   console.log(`[Zoom Mux] Attempting redirect resolution for file: ${originalFilename}`);
 
@@ -1451,6 +1454,7 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
 
   return uploadResult;
 }
+
 
 // ==========================================
 // EXPRESS ROUTE HANDLER
