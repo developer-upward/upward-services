@@ -1309,7 +1309,7 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 
 
 // ==========================================
-// DIAGNOSTIC ZOOM WEBHOOKS WITH FULL CONSOLE LOGGING
+// FINAL RESOLVED ZOOM WEBHOOKS (WITH DIRECT VIDEO URL + MUX)
 // ==========================================
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
@@ -1475,7 +1475,7 @@ app.post('/webhooks/zoom', async (req, res) => {
       });
     }
 
-    // 2. Acknowledge Zoom event immediately (within 3 seconds) to prevent retries
+    // 2. Acknowledge Zoom event immediately to prevent retries
     res.status(200).send('EVENT_RECEIVED');
 
     const { event, payload } = req.body;
@@ -1520,13 +1520,11 @@ app.post('/webhooks/zoom', async (req, res) => {
     // HANDLER: meeting.summary_completed
     // ==========================================
     if (event === 'meeting.summary_completed') {
-      // Find summary content at either root payload level or payload.object level
       let rawSummary = payload.summary_content || payload.object.summary_content || '';
       let summaryDocUrl = payload.summary_doc_url || payload.object.summary_doc_url || '';
 
-      // If the summary is structured as an object, parse it cleanly to text
       if (typeof rawSummary === 'object' && rawSummary !== null) {
-        console.log('[Webhook Router] Summary is a JSON object. Parsing fields to Markdown string...');
+        console.log('[Webhook Router] Summary is a JSON object. Parsing fields to Markdown...');
         const summaryText = rawSummary.summary || '';
         const nextSteps = Array.isArray(rawSummary.next_steps) 
           ? rawSummary.next_steps.map((step) => `* ${step}`).join('\n') 
@@ -1543,19 +1541,23 @@ app.post('/webhooks/zoom', async (req, res) => {
         summary_doc_url: summaryDocUrl
       };
 
-      // --- DIAGNOSTIC LOG 2: Outgoing Summary payload to Bubble ---
+      // --- DIAGNOSTIC LOG 2: Outgoing Summary payload ---
       console.log(`\n--- [OUTGOING SUMMARY PAYLOAD TO BUBBLE] ---`);
       console.log(JSON.stringify(summaryPayload, null, 2));
       console.log('--------------------------------------------\n');
 
       console.log(`[Webhook Router] Forwarding Summary Payload to Bubble...`);
-      await axios.post(BUBBLE_SUMMARY_ENDPOINT, summaryPayload, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-        }
-      });
-      console.log(`[Webhook Router] Summary successfully sent to Bubble for Meeting: ${meetingId}`);
+      try {
+        const bubbleRes = await axios.post(BUBBLE_SUMMARY_ENDPOINT, summaryPayload, {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+          }
+        });
+        console.log(`[Webhook Router] Bubble Response [Status ${bubbleRes.status}]:`, JSON.stringify(bubbleRes.data));
+      } catch (bubbleErr) {
+        console.error(`[Webhook Router] Error sending summary to Bubble:`, bubbleErr.response?.data || bubbleErr.message);
+      }
     }
 
     // ==========================================
@@ -1566,7 +1568,6 @@ app.post('/webhooks/zoom', async (req, res) => {
       const videoFile = files.find((f) => f.file_type === 'MP4');
       const transcriptFile = files.find((f) => f.file_type === 'TRANSCRIPT');
 
-      // Broad-spectrum search for download_token (Sibling, Payload level, or Nested object level)
       const downloadToken = 
         req.body.download_token || 
         payload.download_token || 
@@ -1580,12 +1581,17 @@ app.post('/webhooks/zoom', async (req, res) => {
       }
 
       let muxUploadId = '';
+      let directVideoUrl = '';
       let transcriptJson = '[]';
       let shouldPostToBubble = false;
 
       // 1. Process Video if it's the video-ready event
       if (event === 'recording.completed' && videoFile) {
         shouldPostToBubble = true;
+        
+        // Construct the direct download URL with the authenticating token appended
+        directVideoUrl = `${videoFile.download_url}?token=${downloadToken}`;
+
         try {
           const muxResult = await streamZoomToMux({
             downloadUrl: videoFile.download_url,
@@ -1593,7 +1599,9 @@ app.post('/webhooks/zoom', async (req, res) => {
             originalFilename: `${meetingTopic || 'zoom_recording'}_${meetingId}.mp4`,
             hostEmail: payload.object.host_email
           });
-          muxUploadId = muxResult?.upload_id || '';
+          
+          muxUploadId = muxResult?.upload_id || muxResult?.id || muxResult?.uploadId || '';
+          console.log(`[Webhook Router] Mux Direct Upload initiated. Captured ID: ${muxUploadId}`);
         } catch (err) {
           console.error('[Webhook Router] Failed streaming Video recording to Mux:', err.message);
         }
@@ -1631,22 +1639,27 @@ app.post('/webhooks/zoom', async (req, res) => {
           meeting_topic: meetingTopic,
           start_time: startTime,
           mux_upload_id: muxUploadId,
+          video_url: directVideoUrl, // <--- DIRECT ZOOM VIDEO DOWNLOAD URL RESTORED HERE
           transcript_json: transcriptJson
         };
 
-        // --- DIAGNOSTIC LOG 3: Outgoing Recording payload to Bubble ---
+        // --- DIAGNOSTIC LOG 3: Outgoing Recording payload ---
         console.log(`\n--- [OUTGOING RECORDING PAYLOAD TO BUBBLE] ---`);
         console.log(JSON.stringify(recordingPayload, null, 2));
         console.log('----------------------------------------------\n');
 
         console.log(`[Webhook Router] Posting recording/transcript payload to Bubble...`);
-        await axios.post(BUBBLE_RECORDING_ENDPOINT, recordingPayload, {
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-          }
-        });
-        console.log(`[Webhook Router] Pipeline fully completed and sent to Bubble.`);
+        try {
+          const bubbleRes = await axios.post(BUBBLE_RECORDING_ENDPOINT, recordingPayload, {
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+            }
+          });
+          console.log(`[Webhook Router] Bubble Response [Status ${bubbleRes.status}]:`, JSON.stringify(bubbleRes.data));
+        } catch (bubbleErr) {
+          console.error(`[Webhook Router] Error sending recording to Bubble:`, bubbleErr.response?.data || bubbleErr.message);
+        }
       }
     }
 
@@ -1654,6 +1667,7 @@ app.post('/webhooks/zoom', async (req, res) => {
     console.error('[Webhook Router] Error routing Zoom webhook events:', error.message);
   }
 });
+
 
 
 
