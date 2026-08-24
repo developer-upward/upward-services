@@ -4930,242 +4930,301 @@ app.get('/api/holidays', (req, res) => {
 ///////////////////////////////////////////////////
 
 /**
- * Helper to fetch GoHighLevel (GHL) credentials securely from your Bubble App.
+ * Helper: Fetches secure GHL access credentials from the Bubble workflow database.
+ * Returns both the 'accessToken' (PIT) and optional 'locationId'.
  */
 async function getGHLCredentials(memberUniqueId, version) {
-  const versionPath = version ? `/${version}` : '';
-  const apiUrl = `https://upward.page${versionPath}/api/1.1/wf/get_ghl_credentials`;
+    const versionPath = version ? `/${version}` : '';
+    const bubbleUrl = `https://upward.page${versionPath}/api/1.1/wf/get_ghl_credentials`;
 
-  try {
-    const response = await fetch(apiUrl, {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
-      },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+    console.log(`[GHL Export] Fetching secure tokens for member: ${memberUniqueId}`);
+    
+    try {
+        const response = await fetch(bubbleUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ member_uid: memberUniqueId })
+        });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Bubble API returned status ${response.status}: ${errText}`);
+        if (!response.ok) {
+            throw new Error(`Failed to contact Bubble credential endpoint. Status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        // Handles standard nested bubble responses or flat responses gracefully
+        const accessToken = data.response?.access_token || data.access_token;
+        const locationId = data.response?.location_id || data.location_id;
+
+        if (!accessToken) {
+            throw new Error('Access Token (PIT) is completely missing from Bubble credentials.');
+        }
+
+        return { accessToken, locationId };
+    } catch (error) {
+        console.error(`[GHL Export Error] Bubble credential lookup failed:`, error.message);
+        throw error;
     }
-
-    const json = await response.json();
-    const data = json.response || json;
-
-    if (!data.access_token) {
-      throw new Error("GHL Access Token was not returned from the Bubble credentials workflow.");
-    }
-
-    return {
-      accessToken: data.access_token,
-      locationId: data.location_id || null // This might be null/empty, handled below
-    };
-  } catch (error) {
-    console.error(`[GHL Auth Error] Fetching credentials failed:`, error.message);
-    throw error;
-  }
 }
 
 /**
- * Helper to auto-discover Location ID from GHL if Bubble does not provide it.
+ * Helper Fallback: Attempts to dynamically search for the Location ID of the Sub-Account 
+ * if not returned by Bubble. (Requires locations.readonly scope to succeed).
  */
 async function discoverLocationId(accessToken) {
-  try {
-    // Querying location list or location search endpoint using the access token
-    const res = await fetch('https://services.leadconnectorhq.com/locations/search', {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Version': '2021-04-15'
-      }
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      // If GHL returns locations, grab the ID of the first accessible location
-      if (data.locations && data.locations.length > 0) {
-        console.log(`[GHL Auto-Discovery] Discovered Location ID: ${data.locations[0].id} (${data.locations[0].name})`);
-        return data.locations[0].id;
-      }
+    try {
+        const res = await fetch('https://services.leadconnectorhq.com/locations/search', {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Version': '2021-04-15'
+            }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.locations && data.locations.length > 0) {
+            return data.locations[0].id;
+        }
+    } catch (err) {
+        console.warn('[GHL Export Warn] Location dynamic search failed (normal behavior for restricted Sub-Account PITs without Agency access):', err.message);
     }
-  } catch (e) {
-    console.error(`[GHL Auto-Discovery Error] Failed to resolve locations fallback:`, e.message);
-  }
-  return null;
+    return null;
 }
 
 /**
- * Endpoint to process bulk contact uploads directly to GoHighLevel (GHL).
+ * API Route: Receives contacts and exports/upserts them to the connected GoHighLevel account.
+ * Handles dynamic standard vs. custom field routing, missing custom field auto-creation,
+ * and passes the correct GoHighLevel V2 "fieldValue" formats.
  */
-app.post('/api/ghl/export-contacts', express.json({ limit: '10mb' }), async (req, res) => {
-  const { contacts, member_unique_id, version } = req.body;
+app.post('/api/ghl/export-contacts', async (req, res) => {
+    try {
+        const { contacts, member_unique_id, version } = req.body;
 
-  if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
-    return res.status(400).json({ error: 'A valid "contacts" array is required.' });
-  }
-  if (!member_unique_id) {
-    return res.status(400).json({ error: 'The parameter "member_unique_id" is required.' });
-  }
-
-  try {
-    console.log(`[GHL Export] Fetching secure tokens for member: ${member_unique_id}`);
-    let { accessToken, locationId } = await getGHLCredentials(member_unique_id, version);
-
-    // --- FALLBACK DISCOVERY SEQUENCE ---
-    if (!locationId) {
-      console.warn(`[GHL Export Warn] Location ID missing from Bubble response. Initiating dynamic lookup...`);
-      locationId = await discoverLocationId(accessToken);
-      
-      if (!locationId) {
-        return res.status(400).json({ 
-          error: 'Location ID is missing and could not be resolved from your access token scope. Please verify that your GHL account installation is linked to a valid sub-account location.' 
-        });
-      }
-    }
-
-    const authHeaders = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${accessToken}`,
-      'Version': '2021-04-15'
-    };
-
-    // --- 1. FETCH CURRENT CUSTOM FIELDS FROM GHL ---
-    console.log(`[GHL Export] Querying existing custom fields for Location: ${locationId}`);
-    const fieldsRes = await fetch(`https://services.leadconnectorhq.com/locations/${locationId}/customFields`, {
-      method: 'GET',
-      headers: authHeaders
-    });
-
-    if (!fieldsRes.ok) {
-      const errText = await fieldsRes.text();
-      throw new Error(`Failed to fetch GHL custom fields: ${fieldsRes.status} - ${errText}`);
-    }
-
-    const fieldsData = await fieldsRes.json();
-    const existingFields = fieldsData.customFields || [];
-    
-    const fieldMap = {};
-    existingFields.forEach(f => {
-      fieldMap[f.name.toLowerCase().trim()] = f.id;
-    });
-
-    // --- 2. IDENTIFY AND CREATE MISSING CUSTOM FIELDS ---
-    const standardKeys = new Set([
-      "lead name", "lead title", "organization", "lead status", "website",
-      "value of deal", "lead source", "expected win date", "email", 
-      "phone number", "created date", "last contact date", "address", 
-      "city", "state/province", "zip/postal code", "country", "notes"
-    ]);
-
-    const allObjectKeys = new Set();
-    contacts.forEach(c => Object.keys(c).forEach(k => {
-      if (k !== '_id') allObjectKeys.add(k);
-    }));
-
-    for (const key of allObjectKeys) {
-      const normalizedKey = key.toLowerCase().trim();
-      
-      if (!standardKeys.has(normalizedKey) && !fieldMap[normalizedKey]) {
-        console.log(`[GHL Auto-Schema] Creating missing custom field in GHL: "${key}"`);
-        try {
-          const createFieldRes = await fetch(`https://services.leadconnectorhq.com/locations/${locationId}/customFields`, {
-            method: 'POST',
-            headers: authHeaders,
-            body: JSON.stringify({
-              name: key,
-              dataType: 'TEXT', 
-              model: 'contact',
-              position: 0
-            })
-          });
-
-          if (createFieldRes.ok) {
-            const newFieldData = await createFieldRes.json();
-            const createdField = newFieldData.customField;
-            if (createdField && createdField.id) {
-              fieldMap[normalizedKey] = createdField.id;
-              console.log(`[GHL Auto-Schema] Successfully created field "${key}" with ID: ${createdField.id}`);
-            }
-          } else {
-            console.error(`[GHL Auto-Schema Failed] Could not create field "${key}":`, await createFieldRes.text());
-          }
-        } catch (fErr) {
-          console.error(`[GHL Auto-Schema Error] Exception building field "${key}":`, fErr.message);
+        if (!contacts || !Array.isArray(contacts)) {
+            return res.status(400).json({ error: 'Contacts array is required.' });
         }
-      }
-    }
-
-    // --- 3. EXPORT CONTACTS TO GHL ---
-    console.log(`[GHL Export] Initiating upload loop for ${contacts.length} contacts...`);
-    const results = [];
-    const ghlContactEndpoint = 'https://services.leadconnectorhq.com/contacts/';
-
-    for (const contact of contacts) {
-      try {
-        const payload = {
-          locationId: locationId,
-          name: contact["Lead Name"] || undefined,
-          email: contact["Email"] ? contact["Email"].split(' | ')[0] : undefined,
-          phone: contact["Phone Number"] ? contact["Phone Number"].split(' | ')[0] : undefined,
-          companyName: contact["Organization"] || undefined,
-          website: contact["Website"] || undefined,
-          address1: contact["Address"] || undefined,
-          city: contact["City"] || undefined,
-          state: contact["State/Province"] || undefined,
-          postalCode: contact["Zip/Postal Code"] ? String(contact["Zip/Postal Code"]) : undefined,
-          country: contact["Country"] || undefined,
-          tags: contact["Lead Status"] ? [contact["Lead Status"]] : [],
-          customFields: []
-        };
-
-        Object.entries(contact).forEach(([key, val]) => {
-          if (key === '_id' || val === null || val === undefined || val === '') return;
-          const normalizedKey = key.toLowerCase().trim();
-          
-          if (fieldMap[normalizedKey]) {
-            payload.customFields.push({
-              id: fieldMap[normalizedKey],
-              field_value: String(val)
-            });
-          }
-        });
-
-        if (!payload.email && !payload.phone && !payload.name) {
-          results.push({ name: contact["Lead Name"] || 'Unknown', status: 'skipped', reason: 'Missing essential fields (Name, Email, or Phone)' });
-          continue;
+        if (!member_unique_id) {
+            return res.status(400).json({ error: 'Member Unique ID (member_uid) is required.' });
         }
 
-        const ghlResponse = await fetch(ghlContactEndpoint, {
-          method: 'POST',
-          headers: authHeaders,
-          body: JSON.stringify(payload)
-        });
-
-        const resData = await ghlResponse.json();
+        // 1. Fetch credentials
+        const { accessToken, locationId } = await getGHLCredentials(member_unique_id, version);
         
-        if (ghlResponse.ok) {
-          results.push({ name: payload.name || payload.email, status: 'success', id: resData.contact?.id });
-        } else {
-          results.push({ name: payload.name || payload.email, status: 'failed', reason: resData.message || 'API rejected record' });
+        let activeLocationId = locationId;
+        if (!activeLocationId) {
+            console.warn(`[GHL Export Warn] Location ID missing from Bubble response. Initiating dynamic lookup fallback...`);
+            activeLocationId = await discoverLocationId(accessToken);
         }
-      } catch (err) {
-        results.push({ name: contact["Lead Name"] || 'Unknown', status: 'error', reason: err.message });
-      }
+
+        if (!activeLocationId) {
+            return res.status(400).json({
+                error: 'Location ID is required but missing. GoHighLevel requires a valid Location ID to be returned alongside your PIT token.'
+            });
+        }
+
+        console.log(`[GHL Export] Querying existing custom fields for Location: ${activeLocationId}`);
+
+        // 2. Fetch existing custom fields to build a name -> ID map
+        const ghlFieldsRes = await fetch(`https://services.leadconnectorhq.com/locations/${activeLocationId}/customFields`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Version': '2021-04-15'
+            }
+        });
+
+        if (!ghlFieldsRes.ok) {
+            const errorText = await ghlFieldsRes.text();
+            throw new Error(`Failed to fetch GHL custom fields: ${ghlFieldsRes.status} - ${errorText}`);
+        }
+
+        const ghlFieldsData = await ghlFieldsRes.json();
+        const customFieldsMap = {};
+        
+        if (ghlFieldsData.customFields) {
+            ghlFieldsData.customFields.forEach(field => {
+                customFieldsMap[field.name.toLowerCase().trim()] = field.id;
+            });
+        }
+
+        // Standard Contact properties on GHL (including 'facebook' which is standard)
+        const standardFields = [
+            'first name', 'last name', 'name', 'email', 'phone', 
+            'company name', 'website', 'address1', 'city', 'state', 
+            'postal code', 'country', 'facebook'
+        ];
+
+        // 3. Scan contacts for non-standard fields that need to be auto-created in GHL
+        const uniqueFieldNamesToCreate = new Set();
+        contacts.forEach(contact => {
+            Object.keys(contact).forEach(key => {
+                const lowerKey = key.toLowerCase().trim();
+                if (!standardFields.includes(lowerKey) && !customFieldsMap[lowerKey]) {
+                    uniqueFieldNamesToCreate.add(key.trim());
+                }
+            });
+        });
+
+        // 4. Auto-create any missing custom fields in GHL
+        for (const fieldName of uniqueFieldNamesToCreate) {
+            const lowerFieldName = fieldName.toLowerCase().trim();
+            console.log(`[GHL Auto-Schema] Creating missing custom field in GHL: "${fieldName}"`);
+            
+            try {
+                const createFieldRes = await fetch(`https://services.leadconnectorhq.com/locations/${activeLocationId}/customFields`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Version': '2021-04-15',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        name: fieldName,
+                        dataType: 'TEXT', // Defaulting to dynamic text properties
+                        model: 'contact'
+                    })
+                });
+
+                const createFieldData = await createFieldRes.json();
+
+                if (createFieldRes.ok && createFieldData.customField) {
+                    customFieldsMap[lowerFieldName] = createFieldData.customField.id;
+                    console.log(`[GHL Auto-Schema] Successfully created field "${fieldName}" with ID: ${createFieldData.customField.id}`);
+                } else {
+                    console.error(`[GHL Auto-Schema Failed] Could not create field "${fieldName}":`, JSON.stringify(createFieldData));
+                }
+            } catch (err) {
+                console.error(`[GHL Auto-Schema Error] Exception creating field "${fieldName}":`, err.message);
+            }
+        }
+
+        // 5. Send contacts loop
+        console.log(`[GHL Export] Initiating upload loop for ${contacts.length} contacts...`);
+        const results = { success: 0, failed: 0, details: [] };
+
+        for (const contact of contacts) {
+            const contactPayload = {
+                locationId: activeLocationId,
+                customFields: []
+            };
+
+            // Dynamic key mapping
+            Object.keys(contact).forEach(key => {
+                const val = contact[key];
+                if (val === undefined || val === null || val === '') return;
+
+                const lowerKey = key.toLowerCase().trim();
+
+                switch (lowerKey) {
+                    case 'first name':
+                    case 'firstname':
+                        contactPayload.firstName = String(val);
+                        break;
+                    case 'last name':
+                    case 'lastname':
+                        contactPayload.lastName = String(val);
+                        break;
+                    case 'name':
+                    case 'contact name':
+                        contactPayload.name = String(val);
+                        break;
+                    case 'email':
+                        contactPayload.email = String(val).toLowerCase().trim();
+                        break;
+                    case 'phone':
+                        contactPayload.phone = String(val);
+                        break;
+                    case 'company name':
+                    case 'companyname':
+                    case 'company':
+                        contactPayload.companyName = String(val);
+                        break;
+                    case 'website':
+                        contactPayload.website = String(val);
+                        break;
+                    case 'address1':
+                    case 'address':
+                        contactPayload.address1 = String(val);
+                        break;
+                    case 'city':
+                        contactPayload.city = String(val);
+                        break;
+                    case 'state':
+                        contactPayload.state = String(val);
+                        break;
+                    case 'postal code':
+                    case 'postalcode':
+                    case 'zip':
+                        contactPayload.postalCode = String(val);
+                        break;
+                    case 'country':
+                        contactPayload.country = String(val);
+                        break;
+                    case 'facebook':
+                        // Maps 'Facebook' directly to the built-in standard root-level property
+                        contactPayload.facebook = String(val);
+                        break;
+                    default:
+                        // Map any non-standard property to customFields array using 'fieldValue' (V2 format)
+                        const ghlFieldId = customFieldsMap[lowerKey];
+                        if (ghlFieldId) {
+                            contactPayload.customFields.push({
+                                id: ghlFieldId,
+                                fieldValue: String(val) // Correct GHL V2 format key
+                            });
+                        }
+                        break;
+                }
+            });
+
+            // Skip contacts with zero identifier data
+            if (!contactPayload.email && !contactPayload.phone && !contactPayload.name) {
+                results.details.push({ contact: contact.name || 'Unknown', status: 'skipped', reason: 'No identifier found' });
+                continue;
+            }
+
+            try {
+                const contactRes = await fetch('https://services.leadconnectorhq.com/contacts/', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Version': '2021-04-15',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(contactPayload)
+                });
+
+                const contactData = await contactRes.json();
+
+                if (contactRes.ok) {
+                    results.success++;
+                    results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'success' });
+                } else {
+                    results.failed++;
+                    results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'failed', error: contactData });
+                    console.error('[GHL Export] Failed to upsert contact:', JSON.stringify(contactData));
+                }
+            } catch (err) {
+                results.failed++;
+                results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'error', error: err.message });
+                console.error('[GHL Export] Request failure during contact post:', err.message);
+            }
+        }
+
+        return res.status(200).json({
+            message: 'Sync process completed',
+            processed_count: contacts.length,
+            success_count: results.success,
+            failed_count: results.failed,
+            details: results.details
+        });
+
+    } catch (err) {
+        console.error('[GHL Export Process Error]:', err.stack || err.message);
+        return res.status(500).json({ error: err.message });
     }
-
-    res.status(200).json({
-      ok: true,
-      processed_count: contacts.length,
-      details: results
-    });
-
-  } catch (error) {
-    console.error('[GHL Export Process Error]:', error);
-    res.status(500).json({ error: error.message });
-  }
 });
+
 
 
 
