@@ -4942,7 +4942,7 @@ async function getGHLCredentials(memberUniqueId, version) {
     try {
         const response = await fetch(bubbleUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json',"Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}` },
             body: JSON.stringify({ member_uid: memberUniqueId })
         });
 
