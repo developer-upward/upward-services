@@ -1309,7 +1309,7 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 
 
 // ==========================================
-// DUAL-ROUTE DISPATCHED ZOOM WEBHOOKS (LIVE & VERSION-TEST)
+// DUAL-ROUTE DISPATCHED ZOOM WEBHOOKS (SPLIT PIPELINES)
 // ==========================================
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
@@ -1317,48 +1317,52 @@ const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
 // 1. Live Environment Endpoints
 const BUBBLE_SUMMARY_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_summary';
 const BUBBLE_RECORDING_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_recording';
+const BUBBLE_TRANSCRIPT_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_recording_transcript';
 
 // 2. Test Environment Endpoints
 const BUBBLE_SUMMARY_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_summary';
 const BUBBLE_RECORDING_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording';
+const BUBBLE_TRANSCRIPT_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording_transcript';
 
 // Toggle this flag to true/false to enable/disable forwarding to the version-test environment
 const SEND_TO_TEST_VERSION = true;
 
-// Deduplication cache to prevent handling identical events twice
-const processedMeetingsCache = new Set();
+// Isolated deduplication caches to prevent pipelines from blocking each other
+const processedSummariesCache = new Set();
+const processedVideosCache = new Set();
+const processedTranscriptsCache = new Set();
 
 /**
  * Helper to dispatch payloads to Bubble (handles Live and Test routing automatically)
  */
-async function postToBubble(endpointLive, endpointTest, payload) {
+async function postToBubble(endpointLive, endpointTest, payload, pipelineName) {
   // Dispatch to Live Bubble database
   try {
-    console.log(`[Webhook Router] Dispatching to LIVE endpoint: ${endpointLive}`);
+    console.log(`[Bubble Outbox] Dispatching ${pipelineName} to LIVE endpoint: ${endpointLive}`);
     const liveRes = await axios.post(endpointLive, payload, {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
       }
     });
-    console.log(`[Webhook Router] Live Response [Status ${liveRes.status}]:`, JSON.stringify(liveRes.data));
+    console.log(`[Bubble Outbox] Live Response [Status ${liveRes.status}]:`, JSON.stringify(liveRes.data));
   } catch (err) {
-    console.error(`[Webhook Router] Error posting to Live Bubble:`, err.response?.data || err.message);
+    console.error(`[Bubble Outbox Error] Error posting ${pipelineName} to Live Bubble:`, err.response?.data || err.message);
   }
 
   // Dispatch to Version-Test Bubble database (if toggle is active)
   if (SEND_TO_TEST_VERSION) {
     try {
-      console.log(`[Webhook Router] Dispatching to TEST endpoint: ${endpointTest}`);
+      console.log(`[Bubble Outbox] Dispatching ${pipelineName} to TEST endpoint: ${endpointTest}`);
       const testRes = await axios.post(endpointTest, payload, {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
         }
       });
-      console.log(`[Webhook Router] Test Response [Status ${testRes.status}]:`, JSON.stringify(testRes.data));
+      console.log(`[Bubble Outbox] Test Response [Status ${testRes.status}]:`, JSON.stringify(testRes.data));
     } catch (err) {
-      console.error(`[Webhook Router] Error posting to Test Bubble:`, err.response?.data || err.message);
+      console.error(`[Bubble Outbox Error] Error posting ${pipelineName} to Test Bubble:`, err.response?.data || err.message);
     }
   }
 }
@@ -1544,22 +1548,22 @@ app.post('/webhooks/zoom', async (req, res) => {
       startTime = payload.object.start_time || '';
     }
 
-    const cacheKey = `${event}_${meetingId}`;
-
-    // Deduplication check
-    if (processedMeetingsCache.has(cacheKey)) {
-      console.log(`[Webhook Router] Ignoring duplicate webhook trigger for key: ${cacheKey}`);
-      return;
-    }
-    processedMeetingsCache.add(cacheKey);
-    setTimeout(() => processedMeetingsCache.delete(cacheKey), 15000); // 15s lock
-
-    console.log(`[Webhook Router] Processing event "${event}" for Meeting ID: ${meetingId}`);
-
     // ==========================================
     // HANDLER: meeting.summary_completed
     // ==========================================
     if (event === 'meeting.summary_completed') {
+      const cacheKey = `summary_${meetingId}`;
+
+      // Deduplication check for Summary pipeline
+      if (processedSummariesCache.has(cacheKey)) {
+        console.log(`[Webhook Router] Ignoring duplicate Summary trigger for key: ${cacheKey}`);
+        return;
+      }
+      processedSummariesCache.add(cacheKey);
+      setTimeout(() => processedSummariesCache.delete(cacheKey), 15000); // 15s lock
+
+      console.log(`[Webhook Router] Processing event "${event}" for Meeting ID: ${meetingId}`);
+
       let rawSummary = payload.summary_content || payload.object.summary_content || '';
       let summaryDocUrl = payload.summary_doc_url || payload.object.summary_doc_url || '';
 
@@ -1582,7 +1586,7 @@ app.post('/webhooks/zoom', async (req, res) => {
       };
 
       console.log(`[Webhook Router] Forwarding Summary Payload...`);
-      await postToBubble(BUBBLE_SUMMARY_LIVE, BUBBLE_SUMMARY_TEST, summaryPayload);
+      await postToBubble(BUBBLE_SUMMARY_LIVE, BUBBLE_SUMMARY_TEST, summaryPayload, 'Summary');
     }
 
     // ==========================================
@@ -1605,74 +1609,98 @@ app.post('/webhooks/zoom', async (req, res) => {
         return;
       }
 
-      let muxUploadId = '';
-      let directVideoUrl = '';
-      let transcriptJson = '[]';
-      let shouldPostToBubble = false;
-
-      // 1. Process Video if it's the video-ready event
+      // 1. Process Video Pathway (recording.completed)
       if (event === 'recording.completed' && videoFile) {
-        shouldPostToBubble = true;
-        directVideoUrl = `${videoFile.download_url}?token=${downloadToken}`;
+        const cacheKey = `video_${meetingId}`;
+        
+        if (processedVideosCache.has(cacheKey)) {
+          console.log(`[Webhook Router] Ignoring duplicate Video trigger for key: ${cacheKey}`);
+        } else {
+          processedVideosCache.add(cacheKey);
+          setTimeout(() => processedVideosCache.delete(cacheKey), 15000); // 15s lock
 
-        try {
-          const muxResult = await streamZoomToMux({
-            downloadUrl: videoFile.download_url,
-            downloadToken,
-            originalFilename: `${meetingTopic || 'zoom_recording'}_${meetingId}.mp4`,
-            hostEmail: payload.object.host_email
-          });
-          
-          muxUploadId = muxResult?.mux_upload_id || '';
-          console.log(`[Webhook Router] Mux Direct Upload initiated. Successfully mapped ID: ${muxUploadId}`);
-        } catch (err) {
-          console.error('[Webhook Router] Failed streaming Video recording to Mux:', err.message);
-        }
-      }
+          console.log(`[Webhook Router] Processing MP4 video recording for Meeting ID: ${meetingId}`);
+          const directVideoUrl = `${videoFile.download_url}?token=${downloadToken}`;
+          let muxUploadId = '';
 
-      // 2. Process Transcript if VTT file is present
-      if (transcriptFile) {
-        shouldPostToBubble = true;
-        try {
-          console.log(`[Webhook Router] Resolving transcript redirect with retry logic...`);
-          const transcriptRedirectRes = await axiosWithRetry({
-            method: 'get',
-            url: transcriptFile.download_url,
-            headers: { Authorization: `Bearer ${downloadToken}` },
-            maxRedirects: 0,
-            validateStatus: (status) => status === 302 || (status >= 200 && status < 300)
-          });
-
-          const finalTranscriptUrl = transcriptRedirectRes.headers.location;
-          if (finalTranscriptUrl) {
-            console.log(`[Webhook Router] Downloading resolved transcript stream...`);
-            const vttRes = await axios({ method: 'get', url: finalTranscriptUrl });
-            transcriptJson = parseVttToJSON(vttRes.data);
+          try {
+            const muxResult = await streamZoomToMux({
+              downloadUrl: videoFile.download_url,
+              downloadToken,
+              originalFilename: `${meetingTopic || 'zoom_recording'}_${meetingId}.mp4`,
+              hostEmail: payload.object.host_email
+            });
+            
+            muxUploadId = muxResult?.mux_upload_id || '';
+            console.log(`[Webhook Router] Mux Direct Upload initiated. Successfully mapped ID: ${muxUploadId}`);
+          } catch (err) {
+            console.error('[Webhook Router] Failed streaming Video recording to Mux:', err.message);
           }
-        } catch (err) {
-          console.error('[Webhook Router] Failed retrieving VTT transcript:', err.message);
+
+          const recordingPayload = {
+            meeting_id: meetingId,
+            meeting_uuid: meetingUuid,
+            meeting_topic: meetingTopic,
+            start_time: startTime,
+            mux_upload_id: muxUploadId,
+            video_url: directVideoUrl
+          };
+
+          console.log(`\n--- [OUTGOING VIDEO PAYLOAD] ---`);
+          console.log(JSON.stringify(recordingPayload, null, 2));
+          console.log('------------------------------------\n');
+
+          await postToBubble(BUBBLE_RECORDING_LIVE, BUBBLE_RECORDING_TEST, recordingPayload, 'Video Recording');
         }
       }
 
-      // 3. Dispatch to Bubble
-      if (shouldPostToBubble) {
-        const recordingPayload = {
-          meeting_id: meetingId,
-          meeting_uuid: meetingUuid,
-          meeting_topic: meetingTopic,
-          start_time: startTime,
-          mux_upload_id: muxUploadId,
-          video_url: directVideoUrl,
-          transcript_json: transcriptJson
-        };
+      // 2. Process Transcript Pathway (recording.completed OR recording.transcript_completed)
+      if (transcriptFile) {
+        const cacheKey = `transcript_${meetingId}`;
 
-        // --- DIAGNOSTIC LOG: Outgoing Payload ---
-        console.log(`\n--- [OUTGOING RECORDING PAYLOAD] ---`);
-        console.log(JSON.stringify(recordingPayload, null, 2));
-        console.log('------------------------------------\n');
+        if (processedTranscriptsCache.has(cacheKey)) {
+          console.log(`[Webhook Router] Ignoring duplicate Transcript trigger for key: ${cacheKey}`);
+        } else {
+          processedTranscriptsCache.add(cacheKey);
+          setTimeout(() => processedTranscriptsCache.delete(cacheKey), 15000); // 15s lock
 
-        console.log(`[Webhook Router] Dispatching Recording/Transcript Payload...`);
-        await postToBubble(BUBBLE_RECORDING_LIVE, BUBBLE_RECORDING_TEST, recordingPayload);
+          console.log(`[Webhook Router] Processing VTT transcript file for Meeting ID: ${meetingId}`);
+          let transcriptJson = '[]';
+
+          try {
+            console.log(`[Webhook Router] Resolving transcript redirect with retry logic...`);
+            const transcriptRedirectRes = await axiosWithRetry({
+              method: 'get',
+              url: transcriptFile.download_url,
+              headers: { Authorization: `Bearer ${downloadToken}` },
+              maxRedirects: 0,
+              validateStatus: (status) => status === 302 || (status >= 200 && status < 300)
+            });
+
+            const finalTranscriptUrl = transcriptRedirectRes.headers.location;
+            if (finalTranscriptUrl) {
+              console.log(`[Webhook Router] Downloading resolved transcript stream...`);
+              const vttRes = await axios({ method: 'get', url: finalTranscriptUrl });
+              transcriptJson = parseVttToJSON(vttRes.data);
+            }
+          } catch (err) {
+            console.error('[Webhook Router] Failed retrieving VTT transcript:', err.message);
+          }
+
+          const transcriptPayload = {
+            meeting_id: meetingId,
+            meeting_uuid: meetingUuid,
+            meeting_topic: meetingTopic,
+            start_time: startTime,
+            transcript_json: transcriptJson
+          };
+
+          console.log(`\n--- [OUTGOING TRANSCRIPT PAYLOAD] ---`);
+          console.log(JSON.stringify(transcriptPayload, null, 2));
+          console.log('------------------------------------\n');
+
+          await postToBubble(BUBBLE_TRANSCRIPT_LIVE, BUBBLE_TRANSCRIPT_TEST, transcriptPayload, 'Transcript');
+        }
       }
     }
 
@@ -1680,9 +1708,6 @@ app.post('/webhooks/zoom', async (req, res) => {
     console.error('[Webhook Router] Error routing Zoom webhook events:', error.message);
   }
 });
-
-
-
 
 
 
