@@ -4925,6 +4925,140 @@ app.get('/api/holidays', (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///////////      GoHighLevel CRM      /////////////
+///////////////////////////////////////////////////
+
+/**
+ * Helper to fetch GoHighLevel (GHL) credentials securely from your Bubble App.
+ * We pass the optional version path and the member's unique ID.
+ */
+async function getGHLCredentials(memberUniqueId, version) {
+  const versionPath = version ? `/${version}` : '';
+  const apiUrl = `https://upward.page${versionPath}/api/1.1/wf/get_ghl_credentials`;
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
+      },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Bubble API returned status ${response.status}: ${errText}`);
+    }
+
+    const json = await response.json();
+    const data = json.response || json;
+
+    // Check if the credentials exist in the payload
+    if (!data.access_token) {
+      throw new Error("GHL Access Token was not returned from the Bubble credentials workflow.");
+    }
+
+    return {
+      accessToken: data.access_token,
+      locationId: data.location_id || null // GHL usually requires a Location ID for API V2 calls
+    };
+  } catch (error) {
+    console.error(`[GHL Auth Error] Fetching credentials failed:`, error.message);
+    throw error;
+  }
+}
+
+/**
+ * Endpoint to process bulk contact uploads directly to GoHighLevel (GHL).
+ * This endpoint accepts raw contacts from the plugin client and pushes them to GHL.
+ */
+app.post('/api/ghl/export-contacts', express.json({ limit: '10mb' }), async (req, res) => {
+  const { contacts, member_unique_id, version } = req.body;
+
+  if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
+    return res.status(400).json({ error: 'A valid "contacts" array is required.' });
+  }
+  if (!member_unique_id) {
+    return res.status(400).json({ error: 'The parameter "member_unique_id" is required.' });
+  }
+
+  try {
+    console.log(`[GHL Export] Fetching secure tokens for member: ${member_unique_id}`);
+    const { accessToken, locationId } = await getGHLCredentials(member_unique_id, version);
+
+    console.log(`[GHL Export] Initiating upload for ${contacts.length} contacts...`);
+    const results = [];
+
+    // GHL V2 Contact Upsert Endpoint
+    const ghlContactEndpoint = 'https://services.gohighlevel.com/contacts/';
+
+    // We process each contact sequentially or in small parallel batches
+    for (const contact of contacts) {
+      try {
+        // GHL V2 Contact schema expectations:
+        // We attempt to map standard values from your schema fields safely
+        const payload = {
+          name: contact["Lead Name"] || undefined,
+          email: contact["Email"] ? contact["Email"].split(' | ')[0] : undefined, // GHL wants a single main string email
+          phone: contact["Phone Number"] ? contact["Phone Number"].split(' | ')[0] : undefined,
+          companyName: contact["Organization"] || undefined,
+          website: contact["Website"] || undefined,
+          address1: contact["Address"] || undefined,
+          city: contact["City"] || undefined,
+          state: contact["State/Province"] || undefined,
+          postalCode: contact["Zip/Postal Code"] || undefined,
+          country: contact["Country"] || undefined,
+        };
+
+        // Inject Location ID if returned/required by your Bubble workflow setup
+        if (locationId) {
+          payload.locationId = locationId;
+        }
+
+        // Only proceed if at least an email, phone, or name is present
+        if (!payload.email && !payload.phone && !payload.name) {
+          results.push({ name: contact["Lead Name"] || 'Unknown', status: 'skipped', reason: 'Missing essential fields (Name, Email, or Phone)' });
+          continue;
+        }
+
+        const ghlResponse = await fetch(ghlContactEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${accessToken}`,
+            'Version': '2021-04-15' // GHL V2 API version header
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const resData = await ghlResponse.json();
+        
+        if (ghlResponse.ok) {
+          results.push({ name: payload.name || payload.email, status: 'success', id: resData.contact?.id });
+        } else {
+          results.push({ name: payload.name || payload.email, status: 'failed', reason: resData.message || 'API rejected connection' });
+        }
+      } catch (err) {
+        results.push({ name: contact["Lead Name"] || 'Unknown', status: 'error', reason: err.message });
+      }
+    }
+
+    res.status(200).json({
+      ok: true,
+      processed_count: contacts.length,
+      details: results
+    });
+
+  } catch (error) {
+    console.error('[GHL Export Process Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
 
 
 ///////////////////////////////////////////////////
