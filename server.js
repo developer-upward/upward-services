@@ -1309,7 +1309,7 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 
 
 // ==========================================
-// ZOOM WEBHOOKS WITH RETRY LOGIC & DYNAMIC FIELD MAPPING
+// DIAGNOSTIC ZOOM WEBHOOKS WITH FULL CONSOLE LOGGING
 // ==========================================
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
@@ -1334,9 +1334,9 @@ async function axiosWithRetry(config, maxRetries = 4, delayMs = 5000) {
           `[Zoom Webhook] Got status ${status} (sync delay). Retrying in ${currentDelay / 1000}s... (Attempt ${attempt}/${maxRetries})`
         );
         await new Promise((resolve) => setTimeout(resolve, currentDelay));
-        currentDelay *= 1.5; // Exponential backoff (5s, 7.5s, 11.25s)
+        currentDelay *= 1.5;
       } else {
-        throw error; // Throw on final attempt or if status is not 401/403
+        throw error;
       }
     }
   }
@@ -1397,18 +1397,15 @@ function parseVttToJSON(vttText) {
  * Streams MP4 from Zoom, resolves CDN redirect, uploads to Mux, and cleans up
  */
 async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, hostEmail }) {
-  // Dynamically resolve the standard and promise-based fs modules to prevent import version conflicts
   const fsSync = typeof require !== 'undefined' ? require('fs') : await import('fs');
   const fsPromises = fsSync.promises || fsSync;
 
-  // Safe directory fallback: uses your existing UPLOAD_DIR if available, otherwise defaults to temporary folder
   const tempDir = typeof UPLOAD_DIR !== 'undefined' ? UPLOAD_DIR : os.tmpdir();
   const uniqueId = Date.now() + '_' + Math.random().toString(36).substring(2, 11);
   const tempPath = path.join(tempDir, `zoom_${uniqueId}_temp.mp4`);
 
   console.log(`[Zoom Mux] Attempting redirect resolution for file: ${originalFilename}`);
 
-  // 1️⃣ Resolve redirect with authorization header, using axiosWithRetry to bypass Zoom's propagation delay
   const redirectRes = await axiosWithRetry({
     method: 'get',
     url: downloadUrl,
@@ -1424,7 +1421,6 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
 
   console.log(`[Zoom Mux] Final secure URL obtained. Beginning stream to local temp file...`);
 
-  // 2️⃣ Download the actual binary stream (DO NOT send headers to S3 redirect URL)
   const downloadRes = await axios({
     method: 'get',
     url: finalDownloadUrl,
@@ -1441,7 +1437,6 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
 
   console.log(`[Zoom Mux] Temp file written successfully. Fetching credentials for host: ${hostEmail}`);
 
-  // 3️⃣ Get Mux Credentials & Upload File
   const muxCredentials = await getMuxCredentials(hostEmail);
   const uploadResult = await uploadToMux({
     filepath: tempPath,
@@ -1451,15 +1446,12 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
     tokenSecret: muxCredentials.secret
   });
 
-  // 4️⃣ Clean up local temp file
   await fsPromises.unlink(tempPath).catch((err) => {
     console.error(`[Zoom Mux] Failed to delete temp file ${tempPath}:`, err.message);
   });
 
   return uploadResult;
 }
-
-
 
 // ==========================================
 // EXPRESS ROUTE HANDLER
@@ -1488,6 +1480,11 @@ app.post('/webhooks/zoom', async (req, res) => {
 
     const { event, payload } = req.body;
     if (!payload || !payload.object) return;
+
+    // --- DIAGNOSTIC LOG 1: Incoming Payload ---
+    console.log(`\n--- [INCOMING ZOOM WEBHOOK PAYLOAD for "${event}"] ---`);
+    console.log(JSON.stringify(req.body, null, 2));
+    console.log('---------------------------------------------------\n');
 
     // --- Dynamic Field Mapping based on Event Type ---
     let meetingId = '';
@@ -1523,14 +1520,33 @@ app.post('/webhooks/zoom', async (req, res) => {
     // HANDLER: meeting.summary_completed
     // ==========================================
     if (event === 'meeting.summary_completed') {
+      // Find summary content at either root payload level or payload.object level
+      let rawSummary = payload.summary_content || payload.object.summary_content || '';
+      let summaryDocUrl = payload.summary_doc_url || payload.object.summary_doc_url || '';
+
+      // If the summary is structured as an object, parse it cleanly to text
+      if (typeof rawSummary === 'object' && rawSummary !== null) {
+        console.log('[Webhook Router] Summary is a JSON object. Parsing fields to Markdown string...');
+        const summaryText = rawSummary.summary || '';
+        const nextSteps = Array.isArray(rawSummary.next_steps) 
+          ? rawSummary.next_steps.map((step) => `* ${step}`).join('\n') 
+          : '';
+        rawSummary = `${summaryText}\n\n### Next Steps:\n${nextSteps}`.trim();
+      }
+
       const summaryPayload = {
         meeting_id: meetingId,
         meeting_uuid: meetingUuid,
         meeting_topic: meetingTopic,
         start_time: startTime,
-        summary_content: payload.summary_content || '',
-        summary_doc_url: payload.summary_doc_url || ''
+        summary_content: rawSummary,
+        summary_doc_url: summaryDocUrl
       };
+
+      // --- DIAGNOSTIC LOG 2: Outgoing Summary payload to Bubble ---
+      console.log(`\n--- [OUTGOING SUMMARY PAYLOAD TO BUBBLE] ---`);
+      console.log(JSON.stringify(summaryPayload, null, 2));
+      console.log('--------------------------------------------\n');
 
       console.log(`[Webhook Router] Forwarding Summary Payload to Bubble...`);
       await axios.post(BUBBLE_SUMMARY_ENDPOINT, summaryPayload, {
@@ -1543,9 +1559,9 @@ app.post('/webhooks/zoom', async (req, res) => {
     }
 
     // ==========================================
-    // HANDLER: recording.completed
+    // HANDLER: recording.completed OR recording.transcript_completed
     // ==========================================
-    if (event === 'recording.completed') {
+    if (event === 'recording.completed' || event === 'recording.transcript_completed') {
       const files = payload.object.recording_files || [];
       const videoFile = files.find((f) => f.file_type === 'MP4');
       const transcriptFile = files.find((f) => f.file_type === 'TRANSCRIPT');
@@ -1565,9 +1581,11 @@ app.post('/webhooks/zoom', async (req, res) => {
 
       let muxUploadId = '';
       let transcriptJson = '[]';
+      let shouldPostToBubble = false;
 
-      // Stream recording to Mux
-      if (videoFile) {
+      // 1. Process Video if it's the video-ready event
+      if (event === 'recording.completed' && videoFile) {
+        shouldPostToBubble = true;
         try {
           const muxResult = await streamZoomToMux({
             downloadUrl: videoFile.download_url,
@@ -1581,8 +1599,9 @@ app.post('/webhooks/zoom', async (req, res) => {
         }
       }
 
-      // Download and parse Transcript (with retry sync lag bypass)
+      // 2. Process Transcript if VTT file is present
       if (transcriptFile) {
+        shouldPostToBubble = true;
         try {
           console.log(`[Webhook Router] Resolving transcript redirect with retry logic...`);
           const transcriptRedirectRes = await axiosWithRetry({
@@ -1604,24 +1623,31 @@ app.post('/webhooks/zoom', async (req, res) => {
         }
       }
 
-      // Forward results to Bubble DB webhook
-      const recordingPayload = {
-        meeting_id: meetingId,
-        meeting_uuid: meetingUuid,
-        meeting_topic: meetingTopic,
-        start_time: startTime,
-        mux_upload_id: muxUploadId,
-        transcript_json: transcriptJson
-      };
+      // 3. Post to Bubble
+      if (shouldPostToBubble) {
+        const recordingPayload = {
+          meeting_id: meetingId,
+          meeting_uuid: meetingUuid,
+          meeting_topic: meetingTopic,
+          start_time: startTime,
+          mux_upload_id: muxUploadId,
+          transcript_json: transcriptJson
+        };
 
-      console.log(`[Webhook Router] Posting recording payload to Bubble...`);
-      await axios.post(BUBBLE_RECORDING_ENDPOINT, recordingPayload, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-        }
-      });
-      console.log(`[Webhook Router] Recording pipeline fully completed and sent to Bubble.`);
+        // --- DIAGNOSTIC LOG 3: Outgoing Recording payload to Bubble ---
+        console.log(`\n--- [OUTGOING RECORDING PAYLOAD TO BUBBLE] ---`);
+        console.log(JSON.stringify(recordingPayload, null, 2));
+        console.log('----------------------------------------------\n');
+
+        console.log(`[Webhook Router] Posting recording/transcript payload to Bubble...`);
+        await axios.post(BUBBLE_RECORDING_ENDPOINT, recordingPayload, {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+          }
+        });
+        console.log(`[Webhook Router] Pipeline fully completed and sent to Bubble.`);
+      }
     }
 
   } catch (error) {
