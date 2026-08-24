@@ -1309,7 +1309,7 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 
 
 // ==========================================
-// FINAL RESOLVED ZOOM WEBHOOKS (WITH DIRECT VIDEO URL + MUX)
+// FULLY SYNCED ZOOM WEBHOOKS (WITH NATIVE MUX MAPPING)
 // ==========================================
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
@@ -1437,6 +1437,7 @@ async function streamZoomToMux({ downloadUrl, downloadToken, originalFilename, h
 
   console.log(`[Zoom Mux] Temp file written successfully. Fetching credentials for host: ${hostEmail}`);
 
+  // Triggers your perfectly-working uploadToMux helper function
   const muxCredentials = await getMuxCredentials(hostEmail);
   const uploadResult = await uploadToMux({
     filepath: tempPath,
@@ -1480,11 +1481,6 @@ app.post('/webhooks/zoom', async (req, res) => {
 
     const { event, payload } = req.body;
     if (!payload || !payload.object) return;
-
-    // --- DIAGNOSTIC LOG 1: Incoming Payload ---
-    console.log(`\n--- [INCOMING ZOOM WEBHOOK PAYLOAD for "${event}"] ---`);
-    console.log(JSON.stringify(req.body, null, 2));
-    console.log('---------------------------------------------------\n');
 
     // --- Dynamic Field Mapping based on Event Type ---
     let meetingId = '';
@@ -1541,11 +1537,6 @@ app.post('/webhooks/zoom', async (req, res) => {
         summary_doc_url: summaryDocUrl
       };
 
-      // --- DIAGNOSTIC LOG 2: Outgoing Summary payload ---
-      console.log(`\n--- [OUTGOING SUMMARY PAYLOAD TO BUBBLE] ---`);
-      console.log(JSON.stringify(summaryPayload, null, 2));
-      console.log('--------------------------------------------\n');
-
       console.log(`[Webhook Router] Forwarding Summary Payload to Bubble...`);
       try {
         const bubbleRes = await axios.post(BUBBLE_SUMMARY_ENDPOINT, summaryPayload, {
@@ -1588,8 +1579,6 @@ app.post('/webhooks/zoom', async (req, res) => {
       // 1. Process Video if it's the video-ready event
       if (event === 'recording.completed' && videoFile) {
         shouldPostToBubble = true;
-        
-        // Construct the direct download URL with the authenticating token appended
         directVideoUrl = `${videoFile.download_url}?token=${downloadToken}`;
 
         try {
@@ -1600,8 +1589,9 @@ app.post('/webhooks/zoom', async (req, res) => {
             hostEmail: payload.object.host_email
           });
           
-          muxUploadId = muxResult?.upload_id || muxResult?.id || muxResult?.uploadId || '';
-          console.log(`[Webhook Router] Mux Direct Upload initiated. Captured ID: ${muxUploadId}`);
+          // MAPS EXACTLY TO THE 'mux_upload_id' RETURNED BY YOUR HELPER
+          muxUploadId = muxResult?.mux_upload_id || '';
+          console.log(`[Webhook Router] Mux Direct Upload initiated. Successfully mapped ID: ${muxUploadId}`);
         } catch (err) {
           console.error('[Webhook Router] Failed streaming Video recording to Mux:', err.message);
         }
@@ -1639,11 +1629,11 @@ app.post('/webhooks/zoom', async (req, res) => {
           meeting_topic: meetingTopic,
           start_time: startTime,
           mux_upload_id: muxUploadId,
-          video_url: directVideoUrl, // <--- DIRECT ZOOM VIDEO DOWNLOAD URL RESTORED HERE
+          video_url: directVideoUrl,
           transcript_json: transcriptJson
         };
 
-        // --- DIAGNOSTIC LOG 3: Outgoing Recording payload ---
+        // --- DIAGNOSTIC LOG: Outgoing Recording payload ---
         console.log(`\n--- [OUTGOING RECORDING PAYLOAD TO BUBBLE] ---`);
         console.log(JSON.stringify(recordingPayload, null, 2));
         console.log('----------------------------------------------\n');
@@ -1667,6 +1657,7 @@ app.post('/webhooks/zoom', async (req, res) => {
     console.error('[Webhook Router] Error routing Zoom webhook events:', error.message);
   }
 });
+
 
 
 
