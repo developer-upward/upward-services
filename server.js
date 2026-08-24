@@ -1309,15 +1309,59 @@ app.get('/login/tokeninfo/zoom', (req, res) => {
 
 
 // ==========================================
-// FULLY SYNCED ZOOM WEBHOOKS (WITH NATIVE MUX MAPPING)
+// DUAL-ROUTE DISPATCHED ZOOM WEBHOOKS (LIVE & VERSION-TEST)
 // ==========================================
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
-const BUBBLE_SUMMARY_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_summary';
-const BUBBLE_RECORDING_ENDPOINT = 'https://upward.page/api/1.1/wf/receive_zoom_recording';
+
+// 1. Live Environment Endpoints
+const BUBBLE_SUMMARY_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_summary';
+const BUBBLE_RECORDING_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_recording';
+
+// 2. Test Environment Endpoints
+const BUBBLE_SUMMARY_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_summary';
+const BUBBLE_RECORDING_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording';
+
+// Toggle this flag to true/false to enable/disable forwarding to the version-test environment
+const SEND_TO_TEST_VERSION = true;
 
 // Deduplication cache to prevent handling identical events twice
 const processedMeetingsCache = new Set();
+
+/**
+ * Helper to dispatch payloads to Bubble (handles Live and Test routing automatically)
+ */
+async function postToBubble(endpointLive, endpointTest, payload) {
+  // Dispatch to Live Bubble database
+  try {
+    console.log(`[Webhook Router] Dispatching to LIVE endpoint: ${endpointLive}`);
+    const liveRes = await axios.post(endpointLive, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+      }
+    });
+    console.log(`[Webhook Router] Live Response [Status ${liveRes.status}]:`, JSON.stringify(liveRes.data));
+  } catch (err) {
+    console.error(`[Webhook Router] Error posting to Live Bubble:`, err.response?.data || err.message);
+  }
+
+  // Dispatch to Version-Test Bubble database (if toggle is active)
+  if (SEND_TO_TEST_VERSION) {
+    try {
+      console.log(`[Webhook Router] Dispatching to TEST endpoint: ${endpointTest}`);
+      const testRes = await axios.post(endpointTest, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+        }
+      });
+      console.log(`[Webhook Router] Test Response [Status ${testRes.status}]:`, JSON.stringify(testRes.data));
+    } catch (err) {
+      console.error(`[Webhook Router] Error posting to Test Bubble:`, err.response?.data || err.message);
+    }
+  }
+}
 
 /**
  * Helper to retry Axios requests if they fail with a 401 or 403 (Zoom server sync lag)
@@ -1537,18 +1581,8 @@ app.post('/webhooks/zoom', async (req, res) => {
         summary_doc_url: summaryDocUrl
       };
 
-      console.log(`[Webhook Router] Forwarding Summary Payload to Bubble...`);
-      try {
-        const bubbleRes = await axios.post(BUBBLE_SUMMARY_ENDPOINT, summaryPayload, {
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-          }
-        });
-        console.log(`[Webhook Router] Bubble Response [Status ${bubbleRes.status}]:`, JSON.stringify(bubbleRes.data));
-      } catch (bubbleErr) {
-        console.error(`[Webhook Router] Error sending summary to Bubble:`, bubbleErr.response?.data || bubbleErr.message);
-      }
+      console.log(`[Webhook Router] Forwarding Summary Payload...`);
+      await postToBubble(BUBBLE_SUMMARY_LIVE, BUBBLE_SUMMARY_TEST, summaryPayload);
     }
 
     // ==========================================
@@ -1589,7 +1623,6 @@ app.post('/webhooks/zoom', async (req, res) => {
             hostEmail: payload.object.host_email
           });
           
-          // MAPS EXACTLY TO THE 'mux_upload_id' RETURNED BY YOUR HELPER
           muxUploadId = muxResult?.mux_upload_id || '';
           console.log(`[Webhook Router] Mux Direct Upload initiated. Successfully mapped ID: ${muxUploadId}`);
         } catch (err) {
@@ -1621,7 +1654,7 @@ app.post('/webhooks/zoom', async (req, res) => {
         }
       }
 
-      // 3. Post to Bubble
+      // 3. Dispatch to Bubble
       if (shouldPostToBubble) {
         const recordingPayload = {
           meeting_id: meetingId,
@@ -1633,23 +1666,13 @@ app.post('/webhooks/zoom', async (req, res) => {
           transcript_json: transcriptJson
         };
 
-        // --- DIAGNOSTIC LOG: Outgoing Recording payload ---
-        console.log(`\n--- [OUTGOING RECORDING PAYLOAD TO BUBBLE] ---`);
+        // --- DIAGNOSTIC LOG: Outgoing Payload ---
+        console.log(`\n--- [OUTGOING RECORDING PAYLOAD] ---`);
         console.log(JSON.stringify(recordingPayload, null, 2));
-        console.log('----------------------------------------------\n');
+        console.log('------------------------------------\n');
 
-        console.log(`[Webhook Router] Posting recording/transcript payload to Bubble...`);
-        try {
-          const bubbleRes = await axios.post(BUBBLE_RECORDING_ENDPOINT, recordingPayload, {
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-            }
-          });
-          console.log(`[Webhook Router] Bubble Response [Status ${bubbleRes.status}]:`, JSON.stringify(bubbleRes.data));
-        } catch (bubbleErr) {
-          console.error(`[Webhook Router] Error sending recording to Bubble:`, bubbleErr.response?.data || bubbleErr.message);
-        }
+        console.log(`[Webhook Router] Dispatching Recording/Transcript Payload...`);
+        await postToBubble(BUBBLE_RECORDING_LIVE, BUBBLE_RECORDING_TEST, recordingPayload);
       }
     }
 
@@ -1657,6 +1680,7 @@ app.post('/webhooks/zoom', async (req, res) => {
     console.error('[Webhook Router] Error routing Zoom webhook events:', error.message);
   }
 });
+
 
 
 
