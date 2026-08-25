@@ -5260,12 +5260,12 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                     let failReason = contactData.message || 'Unknown GHL rejection';
                     if (Array.isArray(failReason)) failReason = failReason.join(', ');
                     
-                    results.details.push({ contact: displayName, status: 'failed', reason: failReason });
+                    results.details.push({ contact: displayName, status: 'failed', error: failReason });
                     console.error('[GHL Export] Failed to upsert contact:', JSON.stringify(contactData));
                 }
             } catch (err) {
                 results.failed++;
-                results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'error', reason: err.message });
+                results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'error', error: err.message });
                 console.error('[GHL Export] Request failure during contact post:', err.message);
             }
         }
@@ -5283,6 +5283,7 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 });
+
 
 
 
