@@ -4942,7 +4942,7 @@ async function getGHLCredentials(memberUniqueId, version) {
     try {
         const response = await fetch(bubbleUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json',"Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}` },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ member: memberUniqueId })
         });
 
@@ -4992,6 +4992,40 @@ async function discoverLocationId(accessToken) {
 }
 
 /**
+ * Helper: Converts full country names to standard ISO 3166-1 alpha-2 codes.
+ * Returns null if no match is found.
+ */
+function convertToISO2Country(countryName) {
+    if (!countryName) return null;
+    const cleanName = countryName.toLowerCase().trim();
+    
+    const countryMap = {
+        'united states': 'US', 'usa': 'US', 'united states of america': 'US',
+        'canada': 'CA',
+        'united kingdom': 'GB', 'uk': 'GB', 'britain': 'GB', 'england': 'GB',
+        'australia': 'AU',
+        'germany': 'DE', 'deutschland': 'DE',
+        'france': 'FR',
+        'india': 'IN',
+        'netherlands': 'NL',
+        'new zealand': 'NZ',
+        'mexico': 'MX',
+        'spain': 'ES',
+        'italy': 'IT',
+        'brazil': 'BR',
+        'south africa': 'ZA',
+        'sweden': 'SE',
+        'switzerland': 'CH'
+    };
+
+    if (cleanName.length === 2) {
+        return cleanName.toUpperCase();
+    }
+    
+    return countryMap[cleanName] || null;
+}
+
+/**
  * API Route: Receives contacts and exports/upserts them to the connected GoHighLevel account.
  * Handles dynamic standard vs. custom field routing, missing custom field auto-creation,
  * and passes the correct GoHighLevel V2 "fieldValue" formats.
@@ -5004,7 +5038,7 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
             return res.status(400).json({ error: 'Contacts array is required.' });
         }
         if (!member_unique_id) {
-            return res.status(400).json({ error: 'Member Unique ID (member_uid) is required.' });
+            return res.status(400).json({ error: 'Member Unique ID (member_unique_id) is required.' });
         }
 
         // 1. Fetch credentials
@@ -5047,11 +5081,12 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
             });
         }
 
-        // Standard Contact properties on GHL (including 'facebook' which is standard)
+        // Expanded list of standard GHL fields to prevent custom field auto-creation collision
         const standardFields = [
-            'first name', 'last name', 'name', 'email', 'phone', 
-            'company name', 'website', 'address1', 'city', 'state', 
-            'postal code', 'country', 'facebook'
+            'first name', 'last name', 'name', 'email', 'phone', 'phone number',
+            'company name', 'companyname', 'company', 'organization', 'website', 
+            'address1', 'address', 'city', 'state', 'state/province', 'postal code', 
+            'postalcode', 'zip', 'zip/postal code', 'country', 'facebook'
         ];
 
         // 3. Scan contacts for non-standard fields that need to be auto-created in GHL
@@ -5059,6 +5094,8 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
         contacts.forEach(contact => {
             Object.keys(contact).forEach(key => {
                 const lowerKey = key.toLowerCase().trim();
+                
+                // If the field isn't standard and doesn't already exist as a custom field, flag it for creation
                 if (!standardFields.includes(lowerKey) && !customFieldsMap[lowerKey]) {
                     uniqueFieldNamesToCreate.add(key.trim());
                 }
@@ -5126,17 +5163,20 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                         break;
                     case 'name':
                     case 'contact name':
+                    case 'lead name':
                         contactPayload.name = String(val);
                         break;
                     case 'email':
                         contactPayload.email = String(val).toLowerCase().trim();
                         break;
                     case 'phone':
+                    case 'phone number':
                         contactPayload.phone = String(val);
                         break;
                     case 'company name':
                     case 'companyname':
                     case 'company':
+                    case 'organization':
                         contactPayload.companyName = String(val);
                         break;
                     case 'website':
@@ -5150,20 +5190,39 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                         contactPayload.city = String(val);
                         break;
                     case 'state':
+                    case 'state/province':
                         contactPayload.state = String(val);
                         break;
                     case 'postal code':
                     case 'postalcode':
                     case 'zip':
+                    case 'zip/postal code':
                         contactPayload.postalCode = String(val);
-                        break;
-                    case 'country':
-                        contactPayload.country = String(val);
                         break;
                     case 'facebook':
                         // Maps 'Facebook' directly to the built-in standard root-level property
                         contactPayload.facebook = String(val);
                         break;
+                    case 'country': {
+                        // Check and translate to a valid ISO 3166-1 alpha-2 code
+                        const countryCode = convertToISO2Country(String(val));
+                        if (countryCode) {
+                            contactPayload.country = countryCode;
+                        } else {
+                            // Raw value is invalid for standard field.
+                            // We omit it from root to prevent 422 rejects, and route it to custom fields instead.
+                            const customCountryId = customFieldsMap['country'] || customFieldsMap['country name'];
+                            if (customCountryId) {
+                                contactPayload.customFields.push({
+                                    id: customCountryId,
+                                    fieldValue: String(val)
+                                });
+                            } else {
+                                console.warn(`[GHL Export Warn] Country value "${val}" is invalid ISO-2 and was skipped to prevent API rejection.`);
+                            }
+                        }
+                        break;
+                    }
                     default:
                         // Map any non-standard property to customFields array using 'fieldValue' (V2 format)
                         const ghlFieldId = customFieldsMap[lowerKey];
@@ -5224,6 +5283,7 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 });
+
 
 
 
