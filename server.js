@@ -4942,7 +4942,10 @@ async function getGHLCredentials(memberUniqueId, version) {
     try {
         const response = await fetch(bubbleUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}` },
+            headers: { 
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+            },
             body: JSON.stringify({ member: memberUniqueId })
         });
 
@@ -4952,7 +4955,6 @@ async function getGHLCredentials(memberUniqueId, version) {
 
         const data = await response.json();
         
-        // Handles standard nested bubble responses or flat responses gracefully
         const accessToken = data.response?.access_token || data.access_token;
         const locationId = data.response?.location_id || data.location_id;
 
@@ -5094,8 +5096,6 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
         contacts.forEach(contact => {
             Object.keys(contact).forEach(key => {
                 const lowerKey = key.toLowerCase().trim();
-                
-                // If the field isn't standard and doesn't already exist as a custom field, flag it for creation
                 if (!standardFields.includes(lowerKey) && !customFieldsMap[lowerKey]) {
                     uniqueFieldNamesToCreate.add(key.trim());
                 }
@@ -5117,7 +5117,7 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                     },
                     body: JSON.stringify({
                         name: fieldName,
-                        dataType: 'TEXT', // Defaulting to dynamic text properties
+                        dataType: 'TEXT',
                         model: 'contact'
                     })
                 });
@@ -5135,8 +5135,8 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
             }
         }
 
-        // 5. Send contacts loop
-        console.log(`[GHL Export] Initiating upload loop for ${contacts.length} contacts...`);
+        // 5. Send contacts loop (Using /contacts/upsert instead of /contacts/)
+        console.log(`[GHL Export] Initiating upload loop for ${contacts.length} contacts using upsert...`);
         const results = { success: 0, failed: 0, details: [] };
 
         for (const contact of contacts) {
@@ -5200,36 +5200,29 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                         contactPayload.postalCode = String(val);
                         break;
                     case 'facebook':
-                        // Maps 'Facebook' directly to the built-in standard root-level property
                         contactPayload.facebook = String(val);
                         break;
                     case 'country': {
-                        // Check and translate to a valid ISO 3166-1 alpha-2 code
                         const countryCode = convertToISO2Country(String(val));
                         if (countryCode) {
                             contactPayload.country = countryCode;
                         } else {
-                            // Raw value is invalid for standard field.
-                            // We omit it from root to prevent 422 rejects, and route it to custom fields instead.
                             const customCountryId = customFieldsMap['country'] || customFieldsMap['country name'];
                             if (customCountryId) {
                                 contactPayload.customFields.push({
                                     id: customCountryId,
                                     fieldValue: String(val)
                                 });
-                            } else {
-                                console.warn(`[GHL Export Warn] Country value "${val}" is invalid ISO-2 and was skipped to prevent API rejection.`);
                             }
                         }
                         break;
                     }
                     default:
-                        // Map any non-standard property to customFields array using 'fieldValue' (V2 format)
                         const ghlFieldId = customFieldsMap[lowerKey];
                         if (ghlFieldId) {
                             contactPayload.customFields.push({
                                 id: ghlFieldId,
-                                fieldValue: String(val) // Correct GHL V2 format key
+                                fieldValue: String(val)
                             });
                         }
                         break;
@@ -5238,12 +5231,13 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
 
             // Skip contacts with zero identifier data
             if (!contactPayload.email && !contactPayload.phone && !contactPayload.name) {
-                results.details.push({ contact: contact.name || 'Unknown', status: 'skipped', reason: 'No identifier found' });
+                results.details.push({ contact: contact.name || 'Unknown', status: 'skipped', reason: 'Missing name, email, and phone number' });
                 continue;
             }
 
             try {
-                const contactRes = await fetch('https://services.leadconnectorhq.com/contacts/', {
+                // Changed from POST /contacts/ to POST /contacts/upsert
+                const contactRes = await fetch('https://services.leadconnectorhq.com/contacts/upsert', {
                     method: 'POST',
                     headers: {
                         'Authorization': `Bearer ${accessToken}`,
@@ -5254,18 +5248,24 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                 });
 
                 const contactData = await contactRes.json();
+                const displayName = contactPayload.email || contactPayload.name || contactPayload.phone;
 
                 if (contactRes.ok) {
                     results.success++;
-                    results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'success' });
+                    results.details.push({ contact: displayName, status: 'success' });
                 } else {
                     results.failed++;
-                    results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'failed', error: contactData });
+                    
+                    // Parse the specific reason for failure
+                    let failReason = contactData.message || 'Unknown GHL rejection';
+                    if (Array.isArray(failReason)) failReason = failReason.join(', ');
+                    
+                    results.details.push({ contact: displayName, status: 'failed', reason: failReason });
                     console.error('[GHL Export] Failed to upsert contact:', JSON.stringify(contactData));
                 }
             } catch (err) {
                 results.failed++;
-                results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'error', error: err.message });
+                results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'error', reason: err.message });
                 console.error('[GHL Export] Request failure during contact post:', err.message);
             }
         }
@@ -5283,6 +5283,7 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 });
+
 
 
 
