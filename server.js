@@ -5145,6 +5145,8 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                 customFields: []
             };
 
+            const originalDisplayName = contact.Email || contact['Phone Number'] || contact.Name || 'Unknown';
+
             // Dynamic key mapping
             Object.keys(contact).forEach(key => {
                 const val = contact[key];
@@ -5166,13 +5168,47 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                     case 'lead name':
                         contactPayload.name = String(val);
                         break;
-                    case 'email':
-                        contactPayload.email = String(val).toLowerCase().trim();
+                    case 'email': {
+                        const rawEmailString = String(val).trim();
+                        if (rawEmailString.includes('|')) {
+                            // Extract the first address as the primary email for GHL root validation
+                            const emailList = rawEmailString.split('|').map(e => e.trim());
+                            contactPayload.email = emailList[0].toLowerCase();
+                            
+                            // Map all emails as an additional custom field so data remains preserved in the dashboard
+                            const fallbackEmailFieldId = customFieldsMap['all_emails'] || customFieldsMap['emails'] || customFieldsMap['email'];
+                            if (fallbackEmailFieldId) {
+                                contactPayload.customFields.push({
+                                    id: fallbackEmailFieldId,
+                                    fieldValue: rawEmailString
+                                });
+                            }
+                        } else {
+                            contactPayload.email = rawEmailString.toLowerCase();
+                        }
                         break;
+                    }
                     case 'phone':
-                    case 'phone number':
-                        contactPayload.phone = String(val);
+                    case 'phone number': {
+                        const rawPhoneString = String(val).trim();
+                        if (rawPhoneString.includes('|')) {
+                            // Extract the first number as primary phone to ensure GHL root compliance
+                            const phoneList = rawPhoneString.split('|').map(p => p.trim());
+                            contactPayload.phone = phoneList[0];
+                            
+                            // Map all numbers as an additional custom field so data remains preserved in the dashboard
+                            const fallbackPhoneFieldId = customFieldsMap['all_phones'] || customFieldsMap['additional phones'];
+                            if (fallbackPhoneFieldId) {
+                                contactPayload.customFields.push({
+                                    id: fallbackPhoneFieldId,
+                                    fieldValue: rawPhoneString
+                                });
+                            }
+                        } else {
+                            contactPayload.phone = rawPhoneString;
+                        }
                         break;
+                    }
                     case 'company name':
                     case 'companyname':
                     case 'company':
@@ -5231,7 +5267,7 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
 
             // Skip contacts with zero identifier data
             if (!contactPayload.email && !contactPayload.phone && !contactPayload.name) {
-                results.details.push({ contact: contact.name || 'Unknown', status: 'skipped', reason: 'Missing name, email, and phone number' });
+                results.details.push({ contact: originalDisplayName, status: 'skipped', reason: 'Missing name, email, and phone number' });
                 continue;
             }
 
@@ -5248,11 +5284,10 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                 });
 
                 const contactData = await contactRes.json();
-                const displayName = contactPayload.email || contactPayload.name || contactPayload.phone;
 
                 if (contactRes.ok) {
                     results.success++;
-                    results.details.push({ contact: displayName, status: 'success' });
+                    results.details.push({ contact: originalDisplayName, status: 'success' });
                 } else {
                     results.failed++;
                     
@@ -5260,12 +5295,12 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
                     let failReason = contactData.message || 'Unknown GHL rejection';
                     if (Array.isArray(failReason)) failReason = failReason.join(', ');
                     
-                    results.details.push({ contact: displayName, status: 'failed', error: failReason });
+                    results.details.push({ contact: originalDisplayName, status: 'failed', error: failReason });
                     console.error('[GHL Export] Failed to upsert contact:', JSON.stringify(contactData));
                 }
             } catch (err) {
                 results.failed++;
-                results.details.push({ contact: contactPayload.email || contactPayload.name, status: 'error', error: err.message });
+                results.details.push({ contact: originalDisplayName, status: 'error', error: err.message });
                 console.error('[GHL Export] Request failure during contact post:', err.message);
             }
         }
