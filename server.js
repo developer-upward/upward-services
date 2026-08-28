@@ -1547,23 +1547,32 @@ app.get('/login/tokeninfo/zoom/v2', (req, res) => {
 
 
 // ==========================================
-// DUAL-ROUTE DISPATCHED ZOOM WEBHOOKS (SPLIT PIPELINES)
+// TRIPLE-ROUTE DISPATCHED ZOOM WEBHOOKS (SPLIT PIPELINES)
 // ==========================================
 
 const ZOOM_WEBHOOK_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_SECRET_TOKEN;
+const ZOOM_WEBHOOK_VERCEL_SECRET_TOKEN = process.env.ZOOM_WEBHOOK_VERCEL_SECRET_TOKEN;
 
-// 1. Live Environment Endpoints
+// 1. Live Environment Endpoints (Bubble)
 const BUBBLE_SUMMARY_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_summary';
 const BUBBLE_RECORDING_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_recording';
 const BUBBLE_TRANSCRIPT_LIVE = 'https://upward.page/api/1.1/wf/receive_zoom_recording_transcript';
 
-// 2. Test Environment Endpoints
+// 2. Test Environment Endpoints (Bubble)
 const BUBBLE_SUMMARY_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_summary';
 const BUBBLE_RECORDING_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording';
 const BUBBLE_TRANSCRIPT_TEST = 'https://upward.page/version-test/api/1.1/wf/receive_zoom_recording_transcript';
 
+// 3. Vercel Environment Endpoints (New)
+const VERCEL_SUMMARY = 'https://tryupward.page/api/public/hooks/zoom-summary';
+const VERCEL_RECORDING = 'https://tryupward.page/api/public/hooks/zoom-recording';
+const VERCEL_TRANSCRIPT = 'https://tryupward.page/api/public/hooks/zoom-transcript';
+
 // Toggle this flag to true/false to enable/disable forwarding to the version-test environment
 const SEND_TO_TEST_VERSION = true;
+
+// Toggle this flag to true/false to enable/disable forwarding to Vercel
+const SEND_TO_VERCEL = true;
 
 // Isolated deduplication caches to prevent pipelines from blocking each other
 const processedSummariesCache = new Set();
@@ -1571,36 +1580,53 @@ const processedVideosCache = new Set();
 const processedTranscriptsCache = new Set();
 
 /**
- * Helper to dispatch payloads to Bubble (handles Live and Test routing automatically)
+ * Helper to dispatch payloads to multiple targets: Bubble Live, Bubble Test, and Vercel.
  */
-async function postToBubble(endpointLive, endpointTest, payload, pipelineName) {
+async function postToDestinations({ bubbleLive, bubbleTest, vercelEndpoint, payload, pipelineName }) {
   // Dispatch to Live Bubble database
   try {
-    console.log(`[Bubble Outbox] Dispatching ${pipelineName} to LIVE endpoint: ${endpointLive}`);
-    const liveRes = await axios.post(endpointLive, payload, {
+    console.log(`[Outbox] Dispatching ${pipelineName} to BUBBLE LIVE endpoint: ${bubbleLive}`);
+    const liveRes = await axios.post(bubbleLive, payload, {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
       }
     });
-    console.log(`[Bubble Outbox] Live Response [Status ${liveRes.status}]:`, JSON.stringify(liveRes.data));
+    console.log(`[Outbox] Bubble Live Response [Status ${liveRes.status}]:`, JSON.stringify(liveRes.data));
   } catch (err) {
-    console.error(`[Bubble Outbox Error] Error posting ${pipelineName} to Live Bubble:`, err.response?.data || err.message);
+    console.error(`[Outbox Error] Error posting ${pipelineName} to Live Bubble:`, err.response?.data || err.message);
   }
 
   // Dispatch to Version-Test Bubble database (if toggle is active)
   if (SEND_TO_TEST_VERSION) {
     try {
-      console.log(`[Bubble Outbox] Dispatching ${pipelineName} to TEST endpoint: ${endpointTest}`);
-      const testRes = await axios.post(endpointTest, payload, {
+      console.log(`[Outbox] Dispatching ${pipelineName} to BUBBLE TEST endpoint: ${bubbleTest}`);
+      const testRes = await axios.post(bubbleTest, payload, {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
         }
       });
-      console.log(`[Bubble Outbox] Test Response [Status ${testRes.status}]:`, JSON.stringify(testRes.data));
+      console.log(`[Outbox] Bubble Test Response [Status ${testRes.status}]:`, JSON.stringify(testRes.data));
     } catch (err) {
-      console.error(`[Bubble Outbox Error] Error posting ${pipelineName} to Test Bubble:`, err.response?.data || err.message);
+      console.error(`[Outbox Error] Error posting ${pipelineName} to Test Bubble:`, err.response?.data || err.message);
+    }
+  }
+
+  // Dispatch to Vercel API Endpoints (if toggle is active)
+  if (SEND_TO_VERCEL && vercelEndpoint) {
+    try {
+      console.log(`[Outbox] Dispatching ${pipelineName} to VERCEL endpoint: ${vercelEndpoint}`);
+      const vercelRes = await axios.post(vercelEndpoint, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.VERCEL_AUTH_SECRET || process.env.BUBBLE_AUTH_SECRET}`,
+          'x-zoom-webhook-secret': ZOOM_WEBHOOK_VERCEL_SECRET_TOKEN
+        }
+      });
+      console.log(`[Outbox] Vercel Response [Status ${vercelRes.status}]:`, JSON.stringify(vercelRes.data));
+    } catch (err) {
+      console.error(`[Outbox Error] Error posting ${pipelineName} to Vercel:`, err.response?.data || err.message);
     }
   }
 }
@@ -1824,7 +1850,13 @@ app.post('/webhooks/zoom', async (req, res) => {
       };
 
       console.log(`[Webhook Router] Forwarding Summary Payload...`);
-      await postToBubble(BUBBLE_SUMMARY_LIVE, BUBBLE_SUMMARY_TEST, summaryPayload, 'Summary');
+      await postToDestinations({
+        bubbleLive: BUBBLE_SUMMARY_LIVE,
+        bubbleTest: BUBBLE_SUMMARY_TEST,
+        vercelEndpoint: VERCEL_SUMMARY,
+        payload: summaryPayload,
+        pipelineName: 'Summary'
+      });
     }
 
     // ==========================================
@@ -1888,7 +1920,13 @@ app.post('/webhooks/zoom', async (req, res) => {
           console.log(JSON.stringify(recordingPayload, null, 2));
           console.log('------------------------------------\n');
 
-          await postToBubble(BUBBLE_RECORDING_LIVE, BUBBLE_RECORDING_TEST, recordingPayload, 'Video Recording');
+          await postToDestinations({
+            bubbleLive: BUBBLE_RECORDING_LIVE,
+            bubbleTest: BUBBLE_RECORDING_TEST,
+            vercelEndpoint: VERCEL_RECORDING,
+            payload: recordingPayload,
+            pipelineName: 'Video Recording'
+          });
         }
       }
 
@@ -1937,7 +1975,13 @@ app.post('/webhooks/zoom', async (req, res) => {
           console.log(JSON.stringify(transcriptPayload, null, 2));
           console.log('------------------------------------\n');
 
-          await postToBubble(BUBBLE_TRANSCRIPT_LIVE, BUBBLE_TRANSCRIPT_TEST, transcriptPayload, 'Transcript');
+          await postToDestinations({
+            bubbleLive: BUBBLE_TRANSCRIPT_LIVE,
+            bubbleTest: BUBBLE_TRANSCRIPT_TEST,
+            vercelEndpoint: VERCEL_TRANSCRIPT,
+            payload: transcriptPayload,
+            pipelineName: 'Transcript'
+          });
         }
       }
     }
