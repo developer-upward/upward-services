@@ -4613,7 +4613,6 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
         if (targetVersion === 'null' || targetVersion === 'undefined') {
           targetVersion = "";
         }
-        
       }
 
       // 5. EXTRACT EMAIL AND NAME FROM iCAL DATA
@@ -4632,20 +4631,46 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
 
       console.log(`>>> FINAL PAYLOAD TO BUBBLE: RSVP ${status} | UID ${unique_id} | VERSION ${targetVersion || 'LIVE'} | EMAIL ${finalAttendeeEmail} <<<`);
 
-      // ---> DYNAMICALLY CONSTRUCT THE BUBBLE ENDPOINT <---
-      const BUBBLE_RSVP_ENDPOINT = targetVersion 
+      // ---> CONSTRUCT ENDPOINTS <---
+      
+      // V1 Endpoint (upward.page) - Still respects versioning
+      const BUBBLE_RSVP_ENDPOINT_V1 = targetVersion 
         ? `https://upward.page/${targetVersion}/api/1.1/wf/update_ical_rsvp`
         : `https://upward.page/api/1.1/wf/update_ical_rsvp`;
       
-      await fetch(BUBBLE_RSVP_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          booking_unique_id: unique_id, 
-          status: status,
-          attendee_email: finalAttendeeEmail,
-          attendee_name: finalAttendeeName  
-        })
+      // V2 Endpoint (tryupward.page) - Always static, no version subpath
+      const BUBBLE_RSVP_ENDPOINT_V2 = `https://tryupward.page/api/public/hooks/rsvp`;
+
+      const payload = {
+        booking_unique_id: unique_id, 
+        status: status,
+        attendee_email: finalAttendeeEmail,
+        attendee_name: finalAttendeeName  
+      };
+
+      // Send requests to both platforms concurrently
+      console.log(`Dispatching webhooks...`);
+      const results = await Promise.allSettled([
+        fetch(BUBBLE_RSVP_ENDPOINT_V1, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }).then(res => ({ label: 'V1 App', status: res.status })),
+
+        fetch(BUBBLE_RSVP_ENDPOINT_V2, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }).then(res => ({ label: 'V2 App', status: res.status }))
+      ]);
+
+      // Log results of the dispatches
+      results.forEach((result) => {
+        if (result.status === 'fulfilled') {
+          console.log(`Webhook successfully sent to ${result.value.label} (Status: ${result.value.status})`);
+        } else {
+          console.error(`Failed to send webhook:`, result.reason);
+        }
       });
 
       // 7. Cleanup
@@ -4658,6 +4683,7 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
     }
   });
 });
+
 
 
 
