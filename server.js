@@ -5628,6 +5628,271 @@ app.post('/api/ghl/export-contacts', async (req, res) => {
 });
 
 
+///////////////////////////////////////////////////
+///////////    Google Mailbox (Gmail)   ///////////
+///////////////////////////////////////////////////
+
+// ==== CONFIGURATION ====
+const CONFIG_GOOGLE_MAILBOX = {
+  // These serve as defaults when no member-specific keys exist
+  DEFAULT_CLIENT_ID: process.env.GOOGLE_MAILBOX_CLIENT_ID || process.env.GOOGLE_CALENDAR_CLIENT_ID,
+  DEFAULT_CLIENT_SECRET: process.env.GOOGLE_MAILBOX_CLIENT_SECRET || process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+  DEFAULT_DOMAIN: process.env.COMPANION_DOMAIN,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'google_mailbox_auth_state',
+  // Scopes required to view, modify, send, and manage their mailbox
+  SCOPES: [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile'
+  ]
+};
+
+// Helper: Get Dynamic Google Mailbox Credentials & Domain
+async function getGoogleMailboxCredentials(memberUniqueId) {
+  let credentials = {
+    clientId: CONFIG_GOOGLE_MAILBOX.DEFAULT_CLIENT_ID,
+    clientSecret: CONFIG_GOOGLE_MAILBOX.DEFAULT_CLIENT_SECRET,
+    // Default redirect URI
+    redirectUri: `https://${CONFIG_GOOGLE_MAILBOX.DEFAULT_DOMAIN}/login/google/mailbox/callback`
+  };
+
+  if (!memberUniqueId) return credentials;
+
+  try {
+    // Queries your Bubble workflow API for user-specific custom credentials
+    const response = await fetch("https://upward.page/api/1.1/wf/get_google_mailbox_credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ member: memberUniqueId })
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const data = json.response || json;
+
+      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+
+      if (isPrivateLabelled) {
+        if (data.client_id && data.client_secret) {
+          credentials.clientId = data.client_id;
+          credentials.clientSecret = data.client_secret;
+        }
+
+        if (data.companion_domain) {
+           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+           credentials.redirectUri = `https://${cleanDomain}/login/google/mailbox/callback`;
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[Google Mailbox Auth] API check failed for ${memberUniqueId}:`, error.message);
+  }
+
+  return credentials;
+}
+
+// ==== STATE UTILS ====
+function generateMailboxStateToken(origin, memberUniqueId) {
+  return jwt.sign({ origin, memberUniqueId }, CONFIG_GOOGLE_MAILBOX.JWT_SECRET, { expiresIn: CONFIG_GOOGLE_MAILBOX.TOKEN_EXPIRY });
+}
+
+function verifyMailboxStateToken(token) {
+  try {
+    // Decodes { origin, memberUniqueId }
+    return jwt.verify(token, CONFIG_GOOGLE_MAILBOX.JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+// ==== LOGIN ENDPOINT ====
+app.get('/login/google/mailbox', async (req, res) => {
+  const { origin, member_unique_id } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  // 1. Fetch Dynamic Credentials and URI configuration
+  const creds = await getGoogleMailboxCredentials(member_unique_id);
+
+  // 2. CHECK DOMAIN MATCH (Pre-flight Redirect)
+  try {
+    const targetUrlObj = new URL(creds.redirectUri);
+    const targetHost = targetUrlObj.host; 
+    const currentHost = req.get('host');  
+
+    if (targetHost && currentHost && targetHost !== currentHost) {
+      const newStartUrl = `https://${targetHost}/login/google/mailbox?origin=${encodeURIComponent(origin)}&member_unique_id=${encodeURIComponent(member_unique_id)}`;
+      return res.redirect(newStartUrl);
+    }
+  } catch (e) {
+    console.error("Error checking domain match", e);
+  }
+
+  // 3. Generate CSRF State & Set Cookie
+  const stateToken = generateMailboxStateToken(origin, member_unique_id);
+  res.cookie(CONFIG_GOOGLE_MAILBOX.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 5 * 60 * 1000 // 5 minutes
+  });
+
+  // 4. Create Dynamic OAuth Client
+  const dynamicOauth2Client = new google.auth.OAuth2(
+    creds.clientId,
+    creds.clientSecret,
+    creds.redirectUri
+  );
+
+  const url = dynamicOauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: false,
+    scope: CONFIG_GOOGLE_MAILBOX.SCOPES,
+    state: stateToken
+  });
+  res.redirect(url);
+});
+
+// ==== CALLBACK ENDPOINT ====
+app.get('/login/google/mailbox/callback', async (req, res) => {
+  const { code } = req.query;
+  const stateToken = req.cookies[CONFIG_GOOGLE_MAILBOX.COOKIE_NAME];
+  
+  const decodedState = verifyMailboxStateToken(stateToken);
+  res.clearCookie(CONFIG_GOOGLE_MAILBOX.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+
+  const origin = decodedState.origin;
+  const memberUniqueId = decodedState.memberUniqueId;
+
+  try {
+    // 1. Re-fetch Dynamic Credentials
+    const creds = await getGoogleMailboxCredentials(memberUniqueId);
+
+    // 2. Create Dynamic Client
+    const dynamicOauth2Client = new google.auth.OAuth2(
+      creds.clientId,
+      creds.clientSecret,
+      creds.redirectUri
+    );
+
+    const { tokens } = await dynamicOauth2Client.getToken(code);
+
+    const refresh_token = tokens.refresh_token || null;
+    const access_token = tokens.access_token || null;
+    const expires_in = tokens.expiry_date
+      ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+      : null;
+
+    const infoForJwt = {
+      refresh_token,
+      access_token,
+      expires_in
+    };
+
+    // Encrypt authentication tokens inside a short-lived temporary JWT
+    const loginToken = jwt.sign(infoForJwt, CONFIG_GOOGLE_MAILBOX.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Mailbox Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-google-mailbox';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('googleMailboxRefreshToken', token);
+              localStorage.setItem('googleMailboxAuthOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4285F4; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    const safeMsg = ("" + error.message).replace(/'/g, "\\'");
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Mailbox Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-google-mailbox',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ==== TOKEN INFO VERIFICATION ENDPOINT ====
+app.get('/login/tokeninfo/mailbox', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ failed: true, error: 'Token is required' });
+
+  try {
+    const decoded = jwt.verify(token, CONFIG_GOOGLE_MAILBOX.JWT_SECRET);
+    if (!decoded.refresh_token) {
+      return res.status(401).json({ failed: true, error: 'No refresh_token present. Did user consent?' });
+    }
+    res.json({
+      refresh_token: decoded.refresh_token,
+      access_token: decoded.access_token,
+      expires_in: decoded.expires_in,
+      failed: false
+    });
+  } catch (err) {
+    res.status(401).json({ failed: true, error: 'Invalid or expired token' });
+  }
+});
+
 
 
 
