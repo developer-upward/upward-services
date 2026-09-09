@@ -4301,7 +4301,7 @@ app.post('/webhooks/facebook', async (req, res) => {
                   const vercelResponse = await fetch(VERCEL_WEBHOOK_RECEIVER, {
                     method: 'POST',
                     headers: {
-                      'Content-Type': 'application/json'
+                      'Content-Type': 'application/json',
                       'x-companion-secret': `${process.env.FACEBOOK_VERIFY_TOKEN}`
                     },
                     body: JSON.stringify(leadData)
