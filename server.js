@@ -4150,6 +4150,7 @@ const crypto = require('crypto');
 
 const FACEBOOK_VERIFY_TOKEN = process.env.FACEBOOK_VERIFY_TOKEN || 'secure_upward_webhook_token_2026';
 const BUBBLE_WEBHOOK_RECEIVER = 'https://upward.page/api/1.1/wf/receive_facebook_lead';
+const VERCEL_WEBHOOK_RECEIVER = 'https://tryupward.page/api/public/hooks/facebook-pages';
 
 app.get('/webhooks/facebook', (req, res) => {
   console.log('\n=== 🔵 INCOMING WEBHOOK VERIFICATION (GET) ===');
@@ -4262,10 +4263,14 @@ app.post('/webhooks/facebook', async (req, res) => {
                   timestamp: eventData.created_time
                 };
 
-                console.log('\n📤 PREPARING TO SEND TO BUBBLE:');
+                console.log('\n📤 PREPARING TO FORWARD EVENT DATA:');
                 console.log(JSON.stringify(leadData, null, 2));
 
+                // -------------------------------------------------------------
+                // 1. SEND TO BUBBLE
+                // -------------------------------------------------------------
                 try {
+                  console.log('\n📤 Sending lead to Bubble...');
                   const bubbleResponse = await fetch(BUBBLE_WEBHOOK_RECEIVER, {
                     method: 'POST',
                     headers: {
@@ -4277,16 +4282,50 @@ app.post('/webhooks/facebook', async (req, res) => {
 
                   if (!bubbleResponse.ok) {
                     const errorText = await bubbleResponse.text();
-                    console.error(`\n❌ HTTP ERROR: Bubble rejected the request. Status: ${bubbleResponse.status}`);
+                    console.error(`❌ HTTP ERROR: Bubble rejected the request. Status: ${bubbleResponse.status}`);
                     console.error(`Bubble Error Details: ${errorText}`);
                   } else {
                     const successData = await bubbleResponse.json();
-                    console.log(`\n🚀 SUCCESS! Bubble successfully received the lead.`);
+                    console.log(`🚀 SUCCESS! Bubble successfully received the lead.`);
                     console.log(`Bubble Response:`, successData);
                   }
                 } catch (error) {
-                  console.error('\n❌ NETWORK ERROR: Failed to communicate with Bubble API:', error.message);
+                  console.error('❌ NETWORK ERROR: Failed to communicate with Bubble API:', error.message);
                 }
+
+                // -------------------------------------------------------------
+                // 2. SEND TO VERCEL
+                // -------------------------------------------------------------
+                try {
+                  console.log('\n📤 Sending lead to Vercel...');
+                  const vercelResponse = await fetch(VERCEL_WEBHOOK_RECEIVER, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json'
+                      'x-companion-secret': `${process.env.FACEBOOK_VERIFY_TOKEN}`
+                    },
+                    body: JSON.stringify(leadData)
+                  });
+
+                  if (!vercelResponse.ok) {
+                    const errorText = await vercelResponse.text();
+                    console.error(`❌ HTTP ERROR: Vercel rejected the request. Status: ${vercelResponse.status}`);
+                    console.error(`Vercel Error Details: ${errorText}`);
+                  } else {
+                    // Try to parse JSON safely, or fallback to text if it's not JSON
+                    let responseContent;
+                    try {
+                      responseContent = await vercelResponse.json();
+                    } catch {
+                      responseContent = await vercelResponse.text();
+                    }
+                    console.log(`🚀 SUCCESS! Vercel successfully received the lead.`);
+                    console.log(`Vercel Response:`, responseContent);
+                  }
+                } catch (error) {
+                  console.error('❌ NETWORK ERROR: Failed to communicate with Vercel API:', error.message);
+                }
+
               } else {
                 console.log(`   ⏭️ Ignoring event: ${eventData.item}/${eventData.verb} does not match target triggers.`);
               }
