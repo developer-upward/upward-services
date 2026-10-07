@@ -5949,10 +5949,10 @@ const CONFIG_OUTLOOK_MAILBOX = {
   // Mail.Read + Mail.Send cover reading, syncing and sending from the mailbox.
   // offline_access is required so Microsoft returns a refresh_token.
   SCOPE: [
-    'https://graph.microsoft.com/openid',
-    'https://graph.microsoft.com/offline_access',
-    'https://graph.microsoft.com/profile',
-    'https://graph.microsoft.com/email',
+    'openid',
+    'offline_access',
+    'profile',
+    'email',
     'https://graph.microsoft.com/Mail.Read',
     'https://graph.microsoft.com/Mail.Send',
     'https://graph.microsoft.com/User.Read'
