@@ -226,40 +226,40 @@ async function getMuxCredentials(memberUniqueId) {
   // If no member ID is provided, strictly use defaults
   if (!memberUniqueId) return credentials;
 
-  try {
-    // 2. Always query the API
-    const response = await fetch("https://upward.page/api/1.1/wf/get_mux_credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member_unique_id: memberUniqueId })
-    });
+  // try {
+  //   // 2. Always query the API
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_mux_credentials", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ member_unique_id: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
+  //   if (response.ok) {
+  //     const json = await response.json();
       
-      // Bubble responses usually nest data inside a "response" object.
-      // We handle both flat structure and nested structure just in case.
-      const data = json.response || json;
+  //     // Bubble responses usually nest data inside a "response" object.
+  //     // We handle both flat structure and nested structure just in case.
+  //     const data = json.response || json;
 
-      // 3. Check the flag
-      // Convert to boolean in case it comes as string "true"
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     // 3. Check the flag
+  //     // Convert to boolean in case it comes as string "true"
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        // Only override if the new keys actually exist
-        if (data.mux_token_id && data.mux_token_secret) {
-          credentials.id = data.mux_token_id;
-          credentials.secret = data.mux_token_secret;
-        } else {
-          console.warn(`[Mux Auth] Private Label requested for ${memberUniqueId} but keys missing. Using default.`);
-        }
-      } 
-      // If private_labelled is false, we simply do nothing and return the `credentials` object (which holds defaults)
-    }
-  } catch (error) {
-    console.error(`[Mux Auth] API check failed for ${memberUniqueId}:`, error.message);
-    // On error, we silently fall back to defaults
-  }
+  //     if (isPrivateLabelled) {
+  //       // Only override if the new keys actually exist
+  //       if (data.mux_token_id && data.mux_token_secret) {
+  //         credentials.id = data.mux_token_id;
+  //         credentials.secret = data.mux_token_secret;
+  //       } else {
+  //         console.warn(`[Mux Auth] Private Label requested for ${memberUniqueId} but keys missing. Using default.`);
+  //       }
+  //     } 
+  //     // If private_labelled is false, we simply do nothing and return the `credentials` object (which holds defaults)
+  //   }
+  // } catch (error) {
+  //   console.error(`[Mux Auth] API check failed for ${memberUniqueId}:`, error.message);
+  //   // On error, we silently fall back to defaults
+  // }
 
   return credentials;
 }
@@ -276,40 +276,40 @@ async function getWasabiCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return config;
 
-  try {
-    // 2. Query API
-    const response = await fetch("https://upward.page/api/1.1/wf/get_wasabi_credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member_unique_id: memberUniqueId })
-    });
+  // try {
+  //   // 2. Query API
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_wasabi_credentials", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ member_unique_id: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      // 3. Check flag
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     // 3. Check flag
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.bucket_key && data.bucket_secret && data.bucket_name) {
-          config.bucket = data.bucket_name;
-          // Ensure endpoint has protocol
-          let ep = data.bucket_endpoint;
-          if (ep && !ep.startsWith('http')) ep = `https://${ep}`;
+  //     if (isPrivateLabelled) {
+  //       if (data.bucket_key && data.bucket_secret && data.bucket_name) {
+  //         config.bucket = data.bucket_name;
+  //         // Ensure endpoint has protocol
+  //         let ep = data.bucket_endpoint;
+  //         if (ep && !ep.startsWith('http')) ep = `https://${ep}`;
           
-          config.endpoint = ep;
-          config.region = data.bucket_region;
-          config.accessKeyId = data.bucket_key;
-          config.secretAccessKey = data.bucket_secret;
-        } else {
-          console.warn(`[Wasabi Auth] Private Label requested for ${memberUniqueId} but keys missing. Using default.`);
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Wasabi Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //         config.endpoint = ep;
+  //         config.region = data.bucket_region;
+  //         config.accessKeyId = data.bucket_key;
+  //         config.secretAccessKey = data.bucket_secret;
+  //       } else {
+  //         console.warn(`[Wasabi Auth] Private Label requested for ${memberUniqueId} but keys missing. Using default.`);
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Wasabi Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return config;
 }
@@ -484,35 +484,35 @@ async function getGoogleCalendarCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    // Note: Assuming the API endpoint follows the naming convention
-    const response = await fetch("https://upward.page/api/1.1/wf/get_google_calendar_credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   // Note: Assuming the API endpoint follows the naming convention
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_google_calendar_credentials", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.client_id && data.client_secret) {
-          credentials.clientId = data.client_id;
-          credentials.clientSecret = data.client_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.client_id && data.client_secret) {
+  //         credentials.clientId = data.client_id;
+  //         credentials.clientSecret = data.client_secret;
+  //       }
 
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/google/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Google Calendar Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/google/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Google Calendar Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -1014,41 +1014,41 @@ async function getZoomCredentials(memberUniqueId, version) {
 
   if (!memberUniqueId) return credentials;
 
-  var app_version = ""
-  if(version){
-    app_version = version;
-  }
+  // var app_version = ""
+  // if(version){
+  //   app_version = version;
+  // }
 
-  try {
-    const response = await fetch(`https://upward.page${app_version}/api/1.1/wf/get_zoom_credentials`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   const response = await fetch(`https://upward.page${app_version}/api/1.1/wf/get_zoom_credentials`, {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.zoom_client_id && data.zoom_client_secret) {
-          credentials.clientId = data.zoom_client_id;
-          credentials.clientSecret = data.zoom_client_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.zoom_client_id && data.zoom_client_secret) {
+  //         credentials.clientId = data.zoom_client_id;
+  //         credentials.clientSecret = data.zoom_client_secret;
+  //       }
         
-        // Check for dynamic domain
-        if (data.companion_domain) {
-           // Ensure no protocol is included in the DB field, or strip it if present
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/zoom/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Zoom Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       // Check for dynamic domain
+  //       if (data.companion_domain) {
+  //          // Ensure no protocol is included in the DB field, or strip it if present
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/zoom/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Zoom Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -1584,34 +1584,34 @@ const processedTranscriptsCache = new Set();
  */
 async function postToDestinations({ bubbleLive, bubbleTest, vercelEndpoint, payload, pipelineName }) {
   // Dispatch to Live Bubble database
-  try {
-    console.log(`[Outbox] Dispatching ${pipelineName} to BUBBLE LIVE endpoint: ${bubbleLive}`);
-    const liveRes = await axios.post(bubbleLive, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-      }
-    });
-    console.log(`[Outbox] Bubble Live Response [Status ${liveRes.status}]:`, JSON.stringify(liveRes.data));
-  } catch (err) {
-    console.error(`[Outbox Error] Error posting ${pipelineName} to Live Bubble:`, err.response?.data || err.message);
-  }
+  // try {
+  //   console.log(`[Outbox] Dispatching ${pipelineName} to BUBBLE LIVE endpoint: ${bubbleLive}`);
+  //   const liveRes = await axios.post(bubbleLive, payload, {
+  //     headers: {
+  //       'Content-Type': 'application/json',
+  //       'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+  //     }
+  //   });
+  //   console.log(`[Outbox] Bubble Live Response [Status ${liveRes.status}]:`, JSON.stringify(liveRes.data));
+  // } catch (err) {
+  //   console.error(`[Outbox Error] Error posting ${pipelineName} to Live Bubble:`, err.response?.data || err.message);
+  // }
 
   // Dispatch to Version-Test Bubble database (if toggle is active)
-  if (SEND_TO_TEST_VERSION) {
-    try {
-      console.log(`[Outbox] Dispatching ${pipelineName} to BUBBLE TEST endpoint: ${bubbleTest}`);
-      const testRes = await axios.post(bubbleTest, payload, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-        }
-      });
-      console.log(`[Outbox] Bubble Test Response [Status ${testRes.status}]:`, JSON.stringify(testRes.data));
-    } catch (err) {
-      console.error(`[Outbox Error] Error posting ${pipelineName} to Test Bubble:`, err.response?.data || err.message);
-    }
-  }
+  // if (SEND_TO_TEST_VERSION) {
+  //   try {
+  //     console.log(`[Outbox] Dispatching ${pipelineName} to BUBBLE TEST endpoint: ${bubbleTest}`);
+  //     const testRes = await axios.post(bubbleTest, payload, {
+  //       headers: {
+  //         'Content-Type': 'application/json',
+  //         'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+  //       }
+  //     });
+  //     console.log(`[Outbox] Bubble Test Response [Status ${testRes.status}]:`, JSON.stringify(testRes.data));
+  //   } catch (err) {
+  //     console.error(`[Outbox Error] Error posting ${pipelineName} to Test Bubble:`, err.response?.data || err.message);
+  //   }
+  // }
 
   // Dispatch to Vercel API Endpoints (if toggle is active)
   if (SEND_TO_VERCEL && vercelEndpoint) {
@@ -2022,34 +2022,34 @@ async function getGoogleAnalyticsCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    const response = await fetch("https://upward.page/api/1.1/wf/get_google_analytics_credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_google_analytics_credentials", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.client_id && data.client_secret) {
-          credentials.clientId = data.client_id;
-          credentials.clientSecret = data.client_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.client_id && data.client_secret) {
+  //         credentials.clientId = data.client_id;
+  //         credentials.clientSecret = data.client_secret;
+  //       }
 
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/google-analytics/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Google Analytics Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/google-analytics/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Google Analytics Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -2295,34 +2295,34 @@ async function getGoogleMeetCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    const response = await fetch("https://upward.page/api/1.1/wf/get_google_meet_credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_google_meet_credentials", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.client_id && data.client_secret) {
-          credentials.clientId = data.client_id;
-          credentials.clientSecret = data.client_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.client_id && data.client_secret) {
+  //         credentials.clientId = data.client_id;
+  //         credentials.clientSecret = data.client_secret;
+  //       }
 
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/google/meet/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Google Meet Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/google/meet/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Google Meet Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -2544,37 +2544,37 @@ async function getGoogleLoginCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    const response = await fetch("https://upward.page/api/1.1/wf/get_google_login_credentials", {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-      },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_google_login_credentials", {
+  //     method: "POST",
+  //     headers: { 
+  //       "Content-Type": "application/json",
+  //       "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+  //     },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.client_id && data.client_secret) {
-          credentials.clientId = data.client_id;
-          credentials.clientSecret = data.client_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.client_id && data.client_secret) {
+  //         credentials.clientId = data.client_id;
+  //         credentials.clientSecret = data.client_secret;
+  //       }
 
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/google/oauth/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Google Login Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/google/oauth/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Google Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -2823,37 +2823,37 @@ async function getFacebookLoginCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_login_credentials", {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-      },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_login_credentials", {
+  //     method: "POST",
+  //     headers: { 
+  //       "Content-Type": "application/json",
+  //       "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+  //     },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.app_id && data.app_secret) {
-          credentials.appId = data.app_id;
-          credentials.appSecret = data.app_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.app_id && data.app_secret) {
+  //         credentials.appId = data.app_id;
+  //         credentials.appSecret = data.app_secret;
+  //       }
 
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/facebook/oauth/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Facebook Login Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/facebook/oauth/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Facebook Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -3227,37 +3227,37 @@ async function getLinkedinLoginCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    const response = await fetch("https://upward.page/api/1.1/wf/get_linkedin_login_credentials", {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-      },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_linkedin_login_credentials", {
+  //     method: "POST",
+  //     headers: { 
+  //       "Content-Type": "application/json",
+  //       "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+  //     },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.client_id && data.client_secret) {
-          credentials.clientId = data.client_id;
-          credentials.clientSecret = data.client_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.client_id && data.client_secret) {
+  //         credentials.clientId = data.client_id;
+  //         credentials.clientSecret = data.client_secret;
+  //       }
 
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/linkedin/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[LinkedIn Login Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/linkedin/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[LinkedIn Login Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -3875,39 +3875,39 @@ async function getFacebookPagesCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_business_login_credentials", {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
-      },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_facebook_business_login_credentials", {
+  //     method: "POST",
+  //     headers: { 
+  //       "Content-Type": "application/json",
+  //       "Authorization": `Bearer ${process.env.BUBBLE_AUTH_SECRET}`
+  //     },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.app_id && data.app_secret) {
-          credentials.appId = data.app_id;
-          credentials.appSecret = data.app_secret;
-        }
-        if (data.configuration_id) {
-          credentials.configId = data.configuration_id;
-        }
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/facebook-pages/oauth/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Facebook Pages Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //     if (isPrivateLabelled) {
+  //       if (data.app_id && data.app_secret) {
+  //         credentials.appId = data.app_id;
+  //         credentials.appSecret = data.app_secret;
+  //       }
+  //       if (data.configuration_id) {
+  //         credentials.configId = data.configuration_id;
+  //       }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/facebook-pages/oauth/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Facebook Pages Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -4269,29 +4269,29 @@ app.post('/webhooks/facebook', async (req, res) => {
                 // -------------------------------------------------------------
                 // 1. SEND TO BUBBLE
                 // -------------------------------------------------------------
-                try {
-                  console.log('\n📤 Sending lead to Bubble...');
-                  const bubbleResponse = await fetch(BUBBLE_WEBHOOK_RECEIVER, {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
-                    },
-                    body: JSON.stringify(leadData)
-                  });
+                // try {
+                //   console.log('\n📤 Sending lead to Bubble...');
+                //   const bubbleResponse = await fetch(BUBBLE_WEBHOOK_RECEIVER, {
+                //     method: 'POST',
+                //     headers: {
+                //       'Content-Type': 'application/json',
+                //       'Authorization': `Bearer ${process.env.BUBBLE_AUTH_SECRET}` 
+                //     },
+                //     body: JSON.stringify(leadData)
+                //   });
 
-                  if (!bubbleResponse.ok) {
-                    const errorText = await bubbleResponse.text();
-                    console.error(`❌ HTTP ERROR: Bubble rejected the request. Status: ${bubbleResponse.status}`);
-                    console.error(`Bubble Error Details: ${errorText}`);
-                  } else {
-                    const successData = await bubbleResponse.json();
-                    console.log(`🚀 SUCCESS! Bubble successfully received the lead.`);
-                    console.log(`Bubble Response:`, successData);
-                  }
-                } catch (error) {
-                  console.error('❌ NETWORK ERROR: Failed to communicate with Bubble API:', error.message);
-                }
+                //   if (!bubbleResponse.ok) {
+                //     const errorText = await bubbleResponse.text();
+                //     console.error(`❌ HTTP ERROR: Bubble rejected the request. Status: ${bubbleResponse.status}`);
+                //     console.error(`Bubble Error Details: ${errorText}`);
+                //   } else {
+                //     const successData = await bubbleResponse.json();
+                //     console.log(`🚀 SUCCESS! Bubble successfully received the lead.`);
+                //     console.log(`Bubble Response:`, successData);
+                //   }
+                // } catch (error) {
+                //   console.error('❌ NETWORK ERROR: Failed to communicate with Bubble API:', error.message);
+                // }
 
                 // -------------------------------------------------------------
                 // 2. SEND TO VERCEL
@@ -4690,11 +4690,11 @@ app.post('/webhooks/sendgrid/inbound_parse', (req, res) => {
       // Send requests to both platforms concurrently
       console.log(`Dispatching webhooks...`);
       const results = await Promise.allSettled([
-        fetch(BUBBLE_RSVP_ENDPOINT_V1, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        }).then(res => ({ label: 'V1 App', status: res.status })),
+        // fetch(BUBBLE_RSVP_ENDPOINT_V1, {
+        //   method: "POST",
+        //   headers: { "Content-Type": "application/json" },
+        //   body: JSON.stringify(payload)
+        // }).then(res => ({ label: 'V1 App', status: res.status })),
 
         fetch(BUBBLE_RSVP_ENDPOINT_V2, {
           method: "POST",
@@ -5701,35 +5701,35 @@ async function getGoogleMailboxCredentials(memberUniqueId) {
 
   if (!memberUniqueId) return credentials;
 
-  try {
-    // Queries your Bubble workflow API for user-specific custom credentials
-    const response = await fetch("https://upward.page/api/1.1/wf/get_google_mailbox_credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ member: memberUniqueId })
-    });
+  // try {
+  //   // Queries your Bubble workflow API for user-specific custom credentials
+  //   const response = await fetch("https://upward.page/api/1.1/wf/get_google_mailbox_credentials", {
+  //     method: "POST",
+  //     headers: { "Content-Type": "application/json" },
+  //     body: JSON.stringify({ member: memberUniqueId })
+  //   });
 
-    if (response.ok) {
-      const json = await response.json();
-      const data = json.response || json;
+  //   if (response.ok) {
+  //     const json = await response.json();
+  //     const data = json.response || json;
 
-      const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
+  //     const isPrivateLabelled = data.private_labelled === true || data.private_labelled === "true";
 
-      if (isPrivateLabelled) {
-        if (data.client_id && data.client_secret) {
-          credentials.clientId = data.client_id;
-          credentials.clientSecret = data.client_secret;
-        }
+  //     if (isPrivateLabelled) {
+  //       if (data.client_id && data.client_secret) {
+  //         credentials.clientId = data.client_id;
+  //         credentials.clientSecret = data.client_secret;
+  //       }
 
-        if (data.companion_domain) {
-           let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-           credentials.redirectUri = `https://${cleanDomain}/login/google/mailbox/callback`;
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[Google Mailbox Auth] API check failed for ${memberUniqueId}:`, error.message);
-  }
+  //       if (data.companion_domain) {
+  //          let cleanDomain = data.companion_domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  //          credentials.redirectUri = `https://${cleanDomain}/login/google/mailbox/callback`;
+  //       }
+  //     }
+  //   }
+  // } catch (error) {
+  //   console.error(`[Google Mailbox Auth] API check failed for ${memberUniqueId}:`, error.message);
+  // }
 
   return credentials;
 }
@@ -5934,7 +5934,208 @@ app.get('/login/tokeninfo/mailbox', (req, res) => {
 
 
 
+///////////////////////////////////////////////////
+///////////   Outlook Mailbox (Microsoft)  ////////
+///////////////////////////////////////////////////
 
+const CONFIG_OUTLOOK_MAILBOX = {
+  CLIENT_ID: process.env.MS_MAILBOX_CLIENT_ID || process.env.OUTLOOK_CALENDAR_CLIENT_ID,
+  CLIENT_SECRET: process.env.MS_MAILBOX_CLIENT_SECRET || process.env.OUTLOOK_CALENDAR_CLIENT_SECRET,
+  REDIRECT_URI: `https://${process.env.COMPANION_DOMAIN}/login/outlook/mailbox/callback`,
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  TOKEN_EXPIRY: '5m',
+  COOKIE_NAME: 'outlook_mailbox_auth_state',
+  AUTHORITY: 'https://login.microsoftonline.com/common',
+  // Mail.Read + Mail.Send cover reading, syncing and sending from the mailbox.
+  // offline_access is required so Microsoft returns a refresh_token.
+  SCOPE: [
+    'openid',
+    'offline_access',
+    'profile',
+    'email',
+    'https://graph.microsoft.com/Mail.Read',
+    'https://graph.microsoft.com/Mail.Send'
+  ],
+};
+
+function generateOutlookMailboxStateToken(origin) {
+  return jwt.sign({ origin }, CONFIG_OUTLOOK_MAILBOX.JWT_SECRET, { expiresIn: CONFIG_OUTLOOK_MAILBOX.TOKEN_EXPIRY });
+}
+function verifyOutlookMailboxStateToken(token) {
+  try {
+    return jwt.verify(token, CONFIG_OUTLOOK_MAILBOX.JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+// ==== LOGIN ENDPOINT ====
+app.get('/login/outlook/mailbox', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).json({ error: 'Origin parameter is required' });
+
+  const stateToken = generateOutlookMailboxStateToken(origin);
+  res.cookie(CONFIG_OUTLOOK_MAILBOX.COOKIE_NAME, stateToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 5 * 60 * 1000, // 5 min
+  });
+
+  const authorizationUri = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?` +
+    `response_type=code` +
+    `&client_id=${encodeURIComponent(CONFIG_OUTLOOK_MAILBOX.CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(CONFIG_OUTLOOK_MAILBOX.REDIRECT_URI)}` +
+    `&scope=${encodeURIComponent(CONFIG_OUTLOOK_MAILBOX.SCOPE.join(' '))}` +
+    `&state=${encodeURIComponent(stateToken)}` +
+    `&prompt=consent`;
+
+  res.redirect(authorizationUri);
+});
+
+// ==== CALLBACK ENDPOINT ====
+app.get('/login/outlook/mailbox/callback', async (req, res) => {
+  const { code, error, error_description } = req.query;
+  const stateToken = req.cookies[CONFIG_OUTLOOK_MAILBOX.COOKIE_NAME];
+  const decodedState = verifyOutlookMailboxStateToken(stateToken);
+  res.clearCookie(CONFIG_OUTLOOK_MAILBOX.COOKIE_NAME);
+
+  if (!decodedState || !decodedState.origin) {
+    return res.status(400).send(`
+      <html><body>
+      <h3>Missing or invalid state token</h3>
+      <p>This usually happens if your browser blocks third-party cookies, or if the domain changed during login.</p>
+      </body></html>
+    `);
+  }
+  const origin = decodedState.origin;
+
+  if (error) {
+    const safeMsg = (error_description || error).replace(/'/g, "\\'");
+    return res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-outlook-mailbox',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+
+  try {
+    // Exchange code for tokens
+    const formdata = new URLSearchParams({
+      client_id: CONFIG_OUTLOOK_MAILBOX.CLIENT_ID,
+      client_secret: CONFIG_OUTLOOK_MAILBOX.CLIENT_SECRET,
+      scope: CONFIG_OUTLOOK_MAILBOX.SCOPE.join(' '),
+      code: code,
+      redirect_uri: CONFIG_OUTLOOK_MAILBOX.REDIRECT_URI,
+      grant_type: 'authorization_code'
+    });
+
+    const fetchResp = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formdata.toString()
+    });
+
+    const rawBody = await fetchResp.text();
+    let tokenObj = null;
+    try {
+      tokenObj = JSON.parse(rawBody);
+    } catch (e) {
+      throw new Error("Token response was not JSON: " + rawBody.slice(0, 200));
+    }
+    if (tokenObj.error) {
+      throw new Error(`Token error: ${tokenObj.error} - ${tokenObj.error_description || ''}`);
+    }
+
+    const refresh_token = tokenObj.refresh_token || null;
+    const access_token = tokenObj.access_token || null;
+    const expires_in = tokenObj.expires_in ? Number(tokenObj.expires_in) : null;
+
+    // Same JWT shape as the Google mailbox flow; verified by /login/tokeninfo/mailbox.
+    const infoForJwt = { refresh_token, access_token, expires_in };
+    const loginToken = jwt.sign(infoForJwt, CONFIG_OUTLOOK_MAILBOX.JWT_SECRET, { expiresIn: '2m' });
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Outlook Mailbox Authentication</title>
+        <script>
+          (function() {
+            const token = '${loginToken}';
+            const targetOrigin = '${origin}';
+            const source = 'companion-outlook-mailbox';
+
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({
+                source: source,
+                loginToken: token,
+                status: 'success'
+              }, targetOrigin);
+
+              localStorage.setItem('outlookMailboxLoginToken', token);
+              localStorage.setItem('outlookMailboxAuthOrigin', targetOrigin);
+
+              setTimeout(() => window.close(), 100);
+            } else {
+              document.getElementById('auto-close').style.display = 'none';
+              document.getElementById('manual-close').style.display = 'block';
+            }
+          })();
+        </script>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 40px; }
+          #manual-close { display: none; margin-top: 20px; }
+          button { padding: 10px 20px; background: #4267B2; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <p id="auto-close">Authentication complete. Closing window...</p>
+        <div id="manual-close">
+          <p>Authentication complete. You may now close this window.</p>
+          <button onclick="window.close()">Close Window</button>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    const safeMsg = ('' + err.message).replace(/'/g, "\\'");
+    console.error("Outlook mailbox oauth2 callback error:", err);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Authentication Error</title>
+        <script>
+          window.opener && window.opener.postMessage({
+            source: 'companion-outlook-mailbox',
+            status: 'error',
+            error: '${safeMsg}'
+          }, '${origin}');
+          window.close();
+        </script>
+      </head>
+      <body>
+        <p>Authentication failed. Closing window...</p>
+      </body>
+      </html>
+    `);
+  }
+});
 
 
 
