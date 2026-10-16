@@ -6139,6 +6139,186 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
 });
 
 
+///////////////////////////////////////////////////////////////
+///   Apple Calendar (iCloud CalDAV) — two-way sync          ///
+///   Paste below the "Apple Login OAuth" section.           ///
+///////////////////////////////////////////////////////////////
+//
+// Why this is NOT OAuth:
+//   Apple offers no OAuth scope for calendars. "Sign in with Apple" only
+//   returns name + email. iCloud Calendar is reached through CalDAV
+//   (https://caldav.icloud.com) using the member's Apple ID email and an
+//   APP-SPECIFIC PASSWORD they create at https://account.apple.com.
+//
+// Reused env keys (already in .env for Sign in with Apple):
+//   COMPANION_DOMAIN, COMPANION_SECRET (JWT state + token signing)
+//   APPLE_CLIENT_ID (stored on the token for traceability only)
+// No new Apple keys are required. Credentials are encrypted with ./encryption.
+//
+// Endpoints (mirror Google/Outlook):
+//   GET  /login/apple/calendar?origin=...   -> popup form
+//   POST /login/apple/calendar/connect      -> verify + postMessage token
+//   GET  /login/tokeninfo/apple             -> decode token (server use)
+//   POST /apple/calendar/list               -> list calendars
+//   POST /apple/calendar/events             -> read events (busy blocks)
+//   POST /apple/calendar/event              -> create/update event (PUT)
+//   POST /apple/calendar/event/delete       -> delete event
+//   POST /apple/calendar/changes            -> incremental sync (sync-token)
+//
+// npm i tsdav   (CalDAV client; works with iCloud)
+
+const { DAVClient } = require('tsdav');
+const { decrypt } = require('./encryption'); // encrypt is already imported above
+
+const APPLE_CAL = {
+  SERVER_URL: 'https://caldav.icloud.com',
+  JWT_SECRET: process.env.COMPANION_SECRET,
+  CLIENT_ID: process.env.APPLE_CLIENT_ID,
+  STATE_COOKIE: 'apple_calendar_state',
+  // NOTE: no host allowlist here. Which sites can use Apple Calendar is
+  // enforced at the app level (src/lib/apple-calendar-rollout.ts); this
+  // companion accepts any origin the app sends.
+};
+
+
+const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function appleDavClient(appleId, appPassword) {
+  const client = new DAVClient({
+    serverUrl: APPLE_CAL.SERVER_URL,
+    credentials: { username: appleId, password: appPassword },
+    authMethod: 'Basic',
+    defaultAccountType: 'caldav',
+  });
+  await client.login(); // throws on wrong Apple ID / app-specific password
+  return client;
+}
+
+// Token = JWT wrapping encrypted credentials. Only the companion can open it.
+function signAppleCalendarToken(appleId, appPassword) {
+  return jwt.sign(
+    { provider: 'apple_calendar', appleId, cred: encrypt(JSON.stringify({ appleId, appPassword })), cid: APPLE_CAL.CLIENT_ID },
+    APPLE_CAL.JWT_SECRET,
+  );
+}
+function openAppleCalendarToken(token) {
+  const d = jwt.verify(token, APPLE_CAL.JWT_SECRET);
+  if (d.provider !== 'apple_calendar') throw new Error('Wrong token type');
+  return JSON.parse(decrypt(d.cred));
+}
+async function clientFromReq(req) {
+  const token = req.body?.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (!token) throw Object.assign(new Error('Missing token'), { status: 401 });
+  const { appleId, appPassword } = openAppleCalendarToken(token);
+  return appleDavClient(appleId, appPassword);
+}
+
+// 1. Popup form
+app.get('/login/apple/calendar', (req, res) => {
+  const { origin } = req.query;
+  if (!origin) return res.status(400).send('Missing origin.');
+  const state = jwt.sign({ origin }, APPLE_CAL.JWT_SECRET, { expiresIn: '10m' });
+  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Apple Calendar</title>
+<style>body{font-family:-apple-system,Arial,sans-serif;max-width:420px;margin:32px auto;padding:0 20px;color:#111}
+label{display:block;margin-top:14px;font-size:14px;font-weight:600}input{width:100%;box-sizing:border-box;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:8px;font-size:15px}
+button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:8px;background:#111;color:#fff;font-size:15px;cursor:pointer}
+.hint{font-size:13px;color:#555;line-height:1.45}#err{color:#c00;font-size:14px;margin-top:12px}</style></head><body>
+<h2>Connect Apple Calendar</h2>
+<p class="hint">Use your Apple ID email and an <b>app-specific password</b> (not your normal password). Create one at
+<a href="https://account.apple.com/account/manage" target="_blank" rel="noopener">account.apple.com</a> → Sign-In and Security → App-Specific Passwords.</p>
+<form id="f"><input type="hidden" name="state" value="${escHtml(state)}">
+<label>Apple ID email<input name="appleId" type="email" required autocomplete="username"></label>
+<label>App-specific password<input name="appPassword" type="password" required placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off"></label>
+<button type="submit" id="b">Connect</button><div id="err"></div></form>
+<script>
+document.getElementById('f').onsubmit=async(e)=>{e.preventDefault();const b=document.getElementById('b');b.disabled=true;b.textContent='Connecting…';
+const r=await fetch('/login/apple/calendar/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});
+const j=await r.json().catch(()=>({}));
+if(!r.ok){document.getElementById('err').textContent=j.error||'Could not connect.';b.disabled=false;b.textContent='Connect';return;}
+if(window.opener){window.opener.postMessage({source:'companion-apple-calendar',status:'success',loginToken:j.token,calendars:j.calendars},j.origin);}
+setTimeout(()=>window.close(),150);};
+</script></body></html>`);
+});
+
+// 2. Verify credentials, return signed token
+app.post('/login/apple/calendar/connect', express.json(), async (req, res) => {
+  try {
+    const { state, appleId, appPassword } = req.body || {};
+    const { origin } = jwt.verify(state, APPLE_CAL.JWT_SECRET);
+    if (!appleId || !appPassword) return res.status(400).json({ error: 'Apple ID and app-specific password are required.' });
+    const client = await appleDavClient(String(appleId).trim(), String(appPassword).trim());
+    const calendars = (await client.fetchCalendars())
+      .filter((c) => (c.components || []).includes('VEVENT'))
+      .map((c) => ({ id: c.url, name: c.displayName, color: c.calendarColor || null }));
+    res.json({ token: signAppleCalendarToken(String(appleId).trim(), String(appPassword).trim()), calendars, origin });
+  } catch (err) {
+    const auth = /401|unauthor/i.test(String(err?.message));
+    console.error('Apple calendar connect error:', err?.message);
+    res.status(auth ? 401 : 400).json({ error: auth ? 'Apple ID or app-specific password is incorrect.' : 'Could not reach iCloud Calendar. Please try again.' });
+  }
+});
+
+// 3. Token info (server-to-server; never returns the password)
+app.get('/login/tokeninfo/apple', (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.query.token;
+    const { appleId } = openAppleCalendarToken(token);
+    res.json({ provider: 'apple_calendar', email: appleId });
+  } catch { res.status(401).json({ error: 'Invalid token' }); }
+});
+
+// 4. List calendars
+app.post('/apple/calendar/list', express.json(), async (req, res) => {
+  try {
+    const client = await clientFromReq(req);
+    const cals = await client.fetchCalendars();
+    res.json(cals.filter((c) => (c.components || []).includes('VEVENT')).map((c) => ({ id: c.url, name: c.displayName, color: c.calendarColor || null, syncToken: c.syncToken || null })));
+  } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// 5. Read events (inbound sync → busy blocks). body: { token, calendarId, start, end }
+app.post('/apple/calendar/events', express.json(), async (req, res) => {
+  try {
+    const { calendarId, start, end } = req.body;
+    const client = await clientFromReq(req);
+    const objs = await client.fetchCalendarObjects({ calendar: { url: calendarId }, timeRange: { start, end }, expand: true });
+    res.json(objs.map((o) => ({ url: o.url, etag: o.etag, ics: o.data })));
+  } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// 6. Create / update event (outbound sync). body: { token, calendarId, uid, ics, url?, etag? }
+app.post('/apple/calendar/event', express.json({ limit: '1mb' }), async (req, res) => {
+  try {
+    const { calendarId, uid, ics, url, etag } = req.body;
+    if (!ics || !/BEGIN:VCALENDAR/.test(ics)) return res.status(400).json({ error: 'ics required' });
+    const client = await clientFromReq(req);
+    const r = url
+      ? await client.updateCalendarObject({ calendarObject: { url, data: ics, etag } })
+      : await client.createCalendarObject({ calendar: { url: calendarId }, filename: `${uid || randomUUID()}.ics`, iCalString: ics });
+    if (!r.ok) return res.status(r.status).json({ error: `iCloud returned ${r.status}` });
+    res.json({ url: url || new URL(`${uid}.ics`, calendarId).toString(), etag: r.headers.get('etag') });
+  } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// 7. Delete event. body: { token, url, etag? }
+app.post('/apple/calendar/event/delete', express.json(), async (req, res) => {
+  try {
+    const client = await clientFromReq(req);
+    const r = await client.deleteCalendarObject({ calendarObject: { url: req.body.url, etag: req.body.etag } });
+    res.json({ ok: r.ok || r.status === 404 });
+  } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// 8. Incremental changes (poll every few minutes). body: { token, calendarId, syncToken }
+app.post('/apple/calendar/changes', express.json(), async (req, res) => {
+  try {
+    const { calendarId, syncToken } = req.body;
+    const client = await clientFromReq(req);
+    const r = await client.smartCollectionSync({ collection: { url: calendarId, syncToken, objects: [] }, method: 'webdav', detailedResult: true });
+    res.json({ syncToken: r.syncToken, created: r.objects.created, updated: r.objects.updated, deleted: r.objects.deleted });
+  } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
