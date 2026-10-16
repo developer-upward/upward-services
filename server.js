@@ -6183,9 +6183,56 @@ const APPLE_CAL = {
 
 const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-async function appleDavClient(appleId, appPassword) {
+// Apple IDs are case-insensitive; app passwords are shown as "abcd-efgh-ijkl-mnop"
+// and are often pasted with spaces or upper case. Normalise both before use.
+const normAppleId = (v) => String(v ?? '').trim().toLowerCase();
+const normAppPassword = (v) => String(v ?? '').replace(/\s+/g, '').toLowerCase();
+
+/**
+ * Checks the credentials directly against iCloud before using tsdav, and finds
+ * the member's real CalDAV host (p01…p180-caldav.icloud.com).
+ *
+ * Why: iCloud answers caldav.icloud.com with redirects to a partition host.
+ * Node's fetch drops the Authorization header on cross-host redirects, so the
+ * second hop is sent with no password and iCloud replies 401 — which looked
+ * like "wrong password" even with the correct one. We follow redirects
+ * manually and re-send the header on every hop.
+ */
+async function icloudPreflight(appleId, appPassword) {
+  const auth = 'Basic ' + Buffer.from(`${appleId}:${appPassword}`, 'utf8').toString('base64');
+  const body = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>';
+  let url = `${APPLE_CAL.SERVER_URL}/`;
+  for (let hop = 0; hop < 5; hop++) {
+    const res = await fetch(url, {
+      method: 'PROPFIND',
+      redirect: 'manual',
+      headers: { Authorization: auth, Depth: '0', 'Content-Type': 'application/xml; charset=utf-8' },
+      body,
+    });
+    if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
+      url = new URL(res.headers.get('location'), url).toString();
+      continue;
+    }
+    if (res.status === 401 || res.status === 403) {
+      const err = new Error(`iCloud rejected the credentials (${res.status})`);
+      err.code = 'APPLE_AUTH';
+      throw err;
+    }
+    if (res.status !== 207 && !res.ok) {
+      const err = new Error(`iCloud returned ${res.status}`);
+      err.code = 'APPLE_UNAVAILABLE';
+      throw err;
+    }
+    return new URL(url).origin; // the partition host that accepted us
+  }
+  const err = new Error('Too many iCloud redirects');
+  err.code = 'APPLE_UNAVAILABLE';
+  throw err;
+}
+
+async function appleDavClient(appleId, appPassword, serverUrl = APPLE_CAL.SERVER_URL) {
   const client = new DAVClient({
-    serverUrl: APPLE_CAL.SERVER_URL,
+    serverUrl,
     credentials: { username: appleId, password: appPassword },
     authMethod: 'Basic',
     defaultAccountType: 'caldav',
@@ -6195,9 +6242,9 @@ async function appleDavClient(appleId, appPassword) {
 }
 
 // Token = JWT wrapping encrypted credentials. Only the companion can open it.
-function signAppleCalendarToken(appleId, appPassword) {
+function signAppleCalendarToken(appleId, appPassword, serverUrl) {
   return jwt.sign(
-    { provider: 'apple_calendar', appleId, cred: encrypt(JSON.stringify({ appleId, appPassword })), cid: APPLE_CAL.CLIENT_ID },
+    { provider: 'apple_calendar', appleId, cred: encrypt(JSON.stringify({ appleId, appPassword, serverUrl })), cid: APPLE_CAL.CLIENT_ID },
     APPLE_CAL.JWT_SECRET,
   );
 }
@@ -6209,8 +6256,8 @@ function openAppleCalendarToken(token) {
 async function clientFromReq(req) {
   const token = req.body?.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (!token) throw Object.assign(new Error('Missing token'), { status: 401 });
-  const { appleId, appPassword } = openAppleCalendarToken(token);
-  return appleDavClient(appleId, appPassword);
+  const { appleId, appPassword, serverUrl } = openAppleCalendarToken(token);
+  return appleDavClient(appleId, appPassword, serverUrl || APPLE_CAL.SERVER_URL);
 }
 
 // 1. Popup form
@@ -6243,18 +6290,34 @@ setTimeout(()=>window.close(),150);};
 // 2. Verify credentials, return signed token
 app.post('/login/apple/calendar/connect', express.json(), async (req, res) => {
   try {
-    const { state, appleId, appPassword } = req.body || {};
-    const { origin } = jwt.verify(state, APPLE_CAL.JWT_SECRET);
+    const body = req.body || {};
+    let origin;
+    try {
+      ({ origin } = jwt.verify(body.state, APPLE_CAL.JWT_SECRET));
+    } catch {
+      return res.status(400).json({ error: 'This window has expired. Please close it and click Connect again.' });
+    }
+    const appleId = normAppleId(body.appleId);
+    const appPassword = normAppPassword(body.appPassword);
     if (!appleId || !appPassword) return res.status(400).json({ error: 'Apple ID and app-specific password are required.' });
-    const client = await appleDavClient(String(appleId).trim(), String(appPassword).trim());
+    if (!/^[a-z]{4}-?[a-z]{4}-?[a-z]{4}-?[a-z]{4}$/.test(appPassword)) {
+      return res.status(400).json({ error: 'That does not look like an app-specific password. It has 16 letters, like abcd-efgh-ijkl-mnop. Your normal Apple ID password will not work.' });
+    }
+    const serverUrl = await icloudPreflight(appleId, appPassword);
+    const client = await appleDavClient(appleId, appPassword, serverUrl);
     const calendars = (await client.fetchCalendars())
       .filter((c) => (c.components || []).includes('VEVENT'))
       .map((c) => ({ id: c.url, name: c.displayName, color: c.calendarColor || null }));
-    res.json({ token: signAppleCalendarToken(String(appleId).trim(), String(appPassword).trim()), calendars, origin });
+    res.json({ token: signAppleCalendarToken(appleId, appPassword, serverUrl), calendars, origin });
   } catch (err) {
-    const auth = /401|unauthor/i.test(String(err?.message));
-    console.error('Apple calendar connect error:', err?.message);
-    res.status(auth ? 401 : 400).json({ error: auth ? 'Apple ID or app-specific password is incorrect.' : 'Could not reach iCloud Calendar. Please try again.' });
+    const msg = String(err?.message || '');
+    const auth = err?.code === 'APPLE_AUTH' || /401|403|unauthor|invalid credentials/i.test(msg);
+    console.error('Apple calendar connect error:', err?.code || '', msg); // never logs the password
+    res.status(auth ? 401 : 502).json({
+      error: auth
+        ? 'iCloud did not accept these details. Use the email you sign in to iCloud with, and a new app-specific password. Also make sure Calendars is turned on in iCloud settings on your iPhone, iPad or Mac.'
+        : 'Could not reach iCloud Calendar. Please try again.',
+    });
   }
 });
 
@@ -6292,11 +6355,12 @@ app.post('/apple/calendar/event', express.json({ limit: '1mb' }), async (req, re
     const { calendarId, uid, ics, url, etag } = req.body;
     if (!ics || !/BEGIN:VCALENDAR/.test(ics)) return res.status(400).json({ error: 'ics required' });
     const client = await clientFromReq(req);
+    const name = `${uid || randomUUID()}.ics`;
     const r = url
       ? await client.updateCalendarObject({ calendarObject: { url, data: ics, etag } })
-      : await client.createCalendarObject({ calendar: { url: calendarId }, filename: `${uid || randomUUID()}.ics`, iCalString: ics });
+      : await client.createCalendarObject({ calendar: { url: calendarId }, filename: name, iCalString: ics });
     if (!r.ok) return res.status(r.status).json({ error: `iCloud returned ${r.status}` });
-    res.json({ url: url || new URL(`${uid}.ics`, calendarId).toString(), etag: r.headers.get('etag') });
+    res.json({ url: url || new URL(name, calendarId).toString(), etag: r.headers.get('etag') });
   } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
 
