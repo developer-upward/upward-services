@@ -6138,6 +6138,8 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
   }
 });
 
+
+
 ///////////////////////////////////////////////////////////////
 ///   Apple Calendar (iCloud CalDAV) — two-way sync          ///
 ///   Paste below the "Apple Login OAuth" section.           ///
@@ -6175,16 +6177,27 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
 //   without any env configuration.
 //
 // Endpoints:
-//   POST /login/apple/calendar/connect   -> verify creds, return token (CORS-enabled)
-//   GET  /login/tokeninfo/apple          -> decode token (server use)
+//   POST /login/apple/calendar/connect   -> verify creds, return token + email (CORS-enabled)
+//   POST /apple/calendar/whoami          -> Apple ID of a token (server use)
+//   GET  /login/tokeninfo/apple          -> legacy alias of whoami
 //   POST /apple/calendar/list            -> list calendars
-//   POST /apple/calendar/events          -> read events (busy blocks)
-//   POST /apple/calendar/event           -> create/update event (PUT)
+//   POST /apple/calendar/busy            -> normalised busy blocks across calendars (inbound sync)
+//   POST /apple/calendar/events          -> raw ICS objects in a range
+//   POST /apple/calendar/event           -> create/update event (outbound sync)
 //   POST /apple/calendar/event/delete    -> delete event
 //   POST /apple/calendar/changes         -> incremental sync (sync-token)
 //
+// WHY /apple/calendar/whoami EXISTS:
+//   The companion's "Sign in with Apple" section can already register
+//   GET /login/tokeninfo/apple for login tokens. Express answers with the
+//   FIRST matching route, so calendar tokens were sent to the login handler,
+//   which returned no email — the app then showed "Apple did not return an
+//   account to connect". The app now calls the unique /apple/calendar/whoami
+//   path first.
+//
 // npm i tsdav   (CalDAV client; works with iCloud)
 
+const crypto = require('crypto');
 const { DAVClient } = require('tsdav');
 
 const APPLE_CAL = {
@@ -6330,7 +6343,7 @@ app.post('/login/apple/calendar/connect', express.json(), async (req, res) => {
     const calendars = (await client.fetchCalendars())
       .filter((c) => (c.components || []).includes('VEVENT'))
       .map((c) => ({ id: c.url, name: c.displayName, color: c.calendarColor || null }));
-    res.json({ token: signAppleCalendarToken(appleId, appPassword, serverUrl), calendars });
+    res.json({ token: signAppleCalendarToken(appleId, appPassword, serverUrl), email: appleId, calendars });
   } catch (err) {
     const msg = String(err?.message || '');
     const auth = err?.code === 'APPLE_AUTH' || /401|403|unauthor|invalid credentials/i.test(msg);
@@ -6343,67 +6356,277 @@ app.post('/login/apple/calendar/connect', express.json(), async (req, res) => {
   }
 });
 
-// 2. Token info (server-to-server; never returns the password)
-app.get('/login/tokeninfo/apple', (req, res) => {
+// 2. Who owns this token (server-to-server; never returns the password)
+app.post('/apple/calendar/whoami', express.json(), (req, res) => {
   try {
-    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.query.token;
+    const token = req.body?.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const { appleId } = openAppleCalendarToken(token);
     res.json({ provider: 'apple_calendar', email: appleId });
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 });
+// Legacy alias. NOTE: if the Sign in with Apple section registers this same
+// path earlier in the file, that handler wins — the app uses /whoami first.
+app.get('/login/tokeninfo/apple', (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.query.token;
+    const { appleId } = openAppleCalendarToken(token);
+    res.json({ provider: 'apple_calendar', email: appleId });
+  } catch { next(); }
+});
+
+// ---------------------------------------------------------------------------
+// Calendar helpers
+// ---------------------------------------------------------------------------
+async function eventCalendars(client) {
+  const cals = await client.fetchCalendars();
+  return cals.filter((c) => (c.components || []).includes('VEVENT'));
+}
+/** "primary" / empty -> the member's default (first writable) iCloud calendar. */
+async function resolveCalendarUrl(client, calendarId) {
+  if (calendarId && calendarId !== 'primary') return calendarId;
+  const cals = await eventCalendars(client);
+  const pick = cals.find((c) => !/reminder|birthday|holiday/i.test(String(c.displayName || ''))) || cals[0];
+  if (!pick) throw Object.assign(new Error('No iCloud calendar found. Turn on Calendars in iCloud settings.'), { status: 404 });
+  return pick.url;
+}
+
+// --------------------------- minimal iCalendar parsing ---------------------
+function unfold(ics) { return String(ics || '').replace(/\r\n/g, '\n').replace(/\n[ \t]/g, ''); }
+function parseLine(line) {
+  const i = line.indexOf(':');
+  if (i < 0) return null;
+  const left = line.slice(0, i);
+  const value = line.slice(i + 1);
+  const [name, ...rawParams] = left.split(';');
+  const params = {};
+  for (const p of rawParams) { const [k, v] = p.split('='); if (k) params[k.toUpperCase()] = (v || '').replace(/^"|"$/g, ''); }
+  return { name: name.toUpperCase(), params, value };
+}
+function vevents(ics) {
+  const out = []; let cur = null; let depth = 0;
+  for (const line of unfold(ics).split('\n')) {
+    if (/^BEGIN:VEVENT/i.test(line)) { cur = { props: {} }; depth = 0; continue; }
+    if (!cur) continue;
+    if (/^BEGIN:/i.test(line)) { depth++; continue; }       // VALARM etc.
+    if (/^END:VEVENT/i.test(line)) { out.push(cur); cur = null; continue; }
+    if (/^END:/i.test(line)) { depth--; continue; }
+    if (depth > 0) continue;
+    const p = parseLine(line);
+    if (!p) continue;
+    (cur.props[p.name] = cur.props[p.name] || []).push(p);
+  }
+  return out;
+}
+const textValue = (v) => String(v || '').replace(/\\n/gi, '\n').replace(/\\([,;\\])/g, '$1');
+
+function tzOffsetMs(utcMs, tz) {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const parts = Object.fromEntries(f.formatToParts(new Date(utcMs)).map((p) => [p.type, p.value]));
+  const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour % 24, +parts.minute, +parts.second);
+  return asUtc - utcMs;
+}
+/** Wall-clock time in an IANA zone -> UTC ms (falls back to UTC for unknown zones). */
+function wallToUtc(y, mo, d, h, mi, s, tz) {
+  const guess = Date.UTC(y, mo, d, h, mi, s);
+  if (!tz) return guess;
+  try {
+    let t = guess - tzOffsetMs(guess, tz);
+    t = guess - tzOffsetMs(t, tz);
+    return t;
+  } catch { return guess; }
+}
+/** Parses DTSTART/DTEND-style values. Returns { ms, allDay, wall, tz }. */
+function parseDate(prop) {
+  if (!prop) return null;
+  const v = prop.value.trim();
+  const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?(Z)?)?$/.exec(v);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s, z] = m;
+  const allDay = prop.params.VALUE === 'DATE' || h === undefined;
+  const wall = { y: +y, mo: +mo - 1, d: +d, h: +(h || 0), mi: +(mi || 0), s: +(s || 0) };
+  const tz = z ? null : prop.params.TZID || null;
+  const ms = allDay || z || !tz ? Date.UTC(wall.y, wall.mo, wall.d, wall.h, wall.mi, wall.s) : wallToUtc(wall.y, wall.mo, wall.d, wall.h, wall.mi, wall.s, tz);
+  return { ms, allDay, wall, tz };
+}
+function parseDuration(v) {
+  const m = /^([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(String(v || '').trim());
+  if (!m) return 0;
+  const sign = m[1] === '-' ? -1 : 1;
+  return sign * ((+(m[2] || 0)) * 604800 + (+(m[3] || 0)) * 86400 + (+(m[4] || 0)) * 3600 + (+(m[5] || 0)) * 60 + (+(m[6] || 0))) * 1000;
+}
+const DAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+/** Expands an RRULE in wall time (only used when iCloud did not expand). */
+function expandRule(start, rule, windowStart, windowEnd, cap = 500) {
+  const r = Object.fromEntries(rule.split(';').map((kv) => kv.split('=')).map(([k, v]) => [k.toUpperCase(), v]));
+  const freq = r.FREQ; const interval = Math.max(1, +(r.INTERVAL || 1));
+  const count = r.COUNT ? +r.COUNT : Infinity;
+  const until = r.UNTIL ? parseDate({ value: r.UNTIL, params: {} })?.ms ?? Infinity : Infinity;
+  const byDay = r.BYDAY ? r.BYDAY.split(',').map((x) => DAYS.indexOf(x.slice(-2))).filter((x) => x >= 0) : null;
+  const out = []; let n = 0;
+  const toMs = (y, mo, d) => (start.allDay || !start.tz) ? Date.UTC(y, mo, d, start.wall.h, start.wall.mi, start.wall.s) : wallToUtc(y, mo, d, start.wall.h, start.wall.mi, start.wall.s, start.tz);
+  const base = new Date(Date.UTC(start.wall.y, start.wall.mo, start.wall.d));
+  for (let i = 0; i < 5000 && n < count && out.length < cap; i++) {
+    let dates = [];
+    const b = new Date(base);
+    if (freq === 'DAILY') { b.setUTCDate(b.getUTCDate() + i * interval); dates = [b]; }
+    else if (freq === 'WEEKLY') {
+      b.setUTCDate(b.getUTCDate() + i * 7 * interval);
+      const days = byDay && byDay.length ? byDay : [base.getUTCDay()];
+      const weekStart = new Date(b); weekStart.setUTCDate(b.getUTCDate() - b.getUTCDay());
+      dates = days.slice().sort().map((wd) => { const x = new Date(weekStart); x.setUTCDate(weekStart.getUTCDate() + wd); return x; }).filter((x) => x >= base);
+    } else if (freq === 'MONTHLY') { b.setUTCMonth(b.getUTCMonth() + i * interval); if (b.getUTCDate() !== base.getUTCDate()) continue; dates = [b]; }
+    else if (freq === 'YEARLY') { b.setUTCFullYear(b.getUTCFullYear() + i * interval); if (b.getUTCDate() !== base.getUTCDate()) continue; dates = [b]; }
+    else break;
+    let stop = false;
+    for (const dt of dates) {
+      const ms = toMs(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate());
+      if (ms > until || ms > windowEnd) { stop = true; break; }
+      n++; if (n > count) { stop = true; break; }
+      if (ms >= windowStart - 86400000 * 2) out.push(ms);
+    }
+    if (stop) break;
+  }
+  return out;
+}
+
+/** Normalises one calendar object into busy blocks inside [start,end]. */
+function busyBlocks(obj, calendarUrl, windowStart, windowEnd) {
+  const evs = vevents(obj.data);
+  const overrides = new Map();
+  const masters = [];
+  for (const ev of evs) {
+    const rid = ev.props['RECURRENCE-ID']?.[0];
+    if (rid) overrides.set(parseDate(rid)?.ms, ev); else masters.push(ev);
+  }
+  const blocks = [];
+  const push = (ev, startMs, isOccurrence) => {
+    const p = ev.props;
+    const s = parseDate(p.DTSTART?.[0]);
+    if (!s) return;
+    const e = parseDate(p.DTEND?.[0]);
+    const len = e ? e.ms - s.ms : p.DURATION ? parseDuration(p.DURATION[0].value) : (s.allDay ? 86400000 : 0);
+    const endMs = startMs + Math.max(len, 0);
+    if (endMs < windowStart || startMs > windowEnd) return;
+    blocks.push({
+      id: isOccurrence ? `${obj.url}#${new Date(startMs).toISOString()}` : obj.url,
+      url: obj.url,
+      etag: obj.etag || null,
+      calendarId: calendarUrl,
+      uid: p.UID?.[0]?.value || null,
+      title: textValue(p.SUMMARY?.[0]?.value) || 'Busy',
+      start: new Date(startMs).toISOString(),
+      end: new Date(endMs).toISOString(),
+      allDay: s.allDay,
+      busy: String(p.TRANSP?.[0]?.value || '').toUpperCase() !== 'TRANSPARENT',
+      cancelled: String(p.STATUS?.[0]?.value || '').toUpperCase() === 'CANCELLED',
+      bookingId: p['X-UPWARD-BOOKING-ID']?.[0]?.value || null,
+    });
+  };
+  // iCloud usually expands recurrences itself (several VEVENTs with RECURRENCE-ID).
+  const expanded = masters.length === 0 || evs.length > 1;
+  for (const ev of masters) {
+    const s = parseDate(ev.props.DTSTART?.[0]);
+    if (!s) continue;
+    const rule = ev.props.RRULE?.[0]?.value;
+    if (!rule) { push(ev, s.ms, false); continue; }
+    const ex = new Set((ev.props.EXDATE || []).flatMap((x) => x.value.split(',').map((v) => parseDate({ value: v, params: x.params })?.ms)));
+    for (const ms of expandRule(s, rule, windowStart, windowEnd)) {
+      if (ex.has(ms) || overrides.has(ms)) continue;
+      push(ev, ms, true);
+    }
+  }
+  for (const [ms, ev] of overrides) if (ms != null) push(ev, parseDate(ev.props.DTSTART?.[0])?.ms ?? ms, true);
+  void expanded;
+  return blocks;
+}
 
 // 3. List calendars
 app.post('/apple/calendar/list', express.json(), async (req, res) => {
   try {
     const client = await clientFromReq(req);
-    const cals = await client.fetchCalendars();
-    res.json(cals.filter((c) => (c.components || []).includes('VEVENT')).map((c) => ({ id: c.url, name: c.displayName, color: c.calendarColor || null, syncToken: c.syncToken || null })));
+    const cals = await eventCalendars(client);
+    res.json(cals.map((c) => ({ id: c.url, name: c.displayName, color: c.calendarColor || null, syncToken: c.syncToken || null })));
   } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
 
-// 4. Read events (inbound sync → busy blocks). body: { token, calendarId, start, end }
+// 4a. Busy blocks for inbound sync. body: { token, calendarId?, start, end }
+//     calendarId omitted / "primary" -> every iCloud calendar of the member.
+app.post('/apple/calendar/busy', express.json(), async (req, res) => {
+  try {
+    const { calendarId, start, end } = req.body || {};
+    const ws = Date.parse(start); const we = Date.parse(end);
+    if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) return res.status(400).json({ error: 'start and end are required' });
+    const client = await clientFromReq(req);
+    const cals = calendarId && calendarId !== 'primary' ? [{ url: calendarId }] : await eventCalendars(client);
+    const events = [];
+    for (const cal of cals) {
+      const objs = await client.fetchCalendarObjects({
+        calendar: { url: cal.url },
+        timeRange: { start: new Date(ws).toISOString(), end: new Date(we).toISOString() },
+        expand: true,
+      });
+      for (const o of objs) {
+        try { events.push(...busyBlocks(o, cal.url, ws, we)); } catch (err) { console.error('Apple busy parse error:', err?.message); }
+      }
+    }
+    res.json({ events });
+  } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// 4b. Raw events. body: { token, calendarId, start, end }
 app.post('/apple/calendar/events', express.json(), async (req, res) => {
   try {
     const { calendarId, start, end } = req.body;
     const client = await clientFromReq(req);
-    const objs = await client.fetchCalendarObjects({ calendar: { url: calendarId }, timeRange: { start, end }, expand: true });
+    const url = await resolveCalendarUrl(client, calendarId);
+    const objs = await client.fetchCalendarObjects({ calendar: { url }, timeRange: { start, end }, expand: true });
     res.json(objs.map((o) => ({ url: o.url, etag: o.etag, ics: o.data })));
   } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
 
-// 5. Create / update event (outbound sync). body: { token, calendarId, uid, ics, url?, etag? }
+// 5. Create / update event (outbound sync). body: { token, calendarId?, uid, ics, url? }
+//    An update whose event was deleted in iCloud is re-created.
 app.post('/apple/calendar/event', express.json({ limit: '1mb' }), async (req, res) => {
   try {
-    const { calendarId, uid, ics, url, etag } = req.body;
+    const { calendarId, uid, ics, url } = req.body || {};
     if (!ics || !/BEGIN:VCALENDAR/.test(ics)) return res.status(400).json({ error: 'ics required' });
     const client = await clientFromReq(req);
-    const name = `${uid || crypto.randomUUID()}.ics`;
-    const r = url
-      ? await client.updateCalendarObject({ calendarObject: { url, data: ics, etag } })
-      : await client.createCalendarObject({ calendar: { url: calendarId }, filename: name, iCalString: ics });
+    if (url) {
+      const r = await client.updateCalendarObject({ calendarObject: { url, data: ics } });
+      if (r.ok) return res.json({ url, etag: r.headers.get('etag') });
+      if (r.status !== 404 && r.status !== 410 && r.status !== 412) return res.status(r.status).json({ error: `iCloud returned ${r.status}` });
+    }
+    const calUrl = await resolveCalendarUrl(client, calendarId);
+    const name = `${String(uid || crypto.randomUUID()).replace(/[^A-Za-z0-9._-]/g, '_')}.ics`;
+    const target = new URL(name, calUrl.endsWith('/') ? calUrl : `${calUrl}/`).toString();
+    let r = await client.createCalendarObject({ calendar: { url: calUrl.endsWith('/') ? calUrl : `${calUrl}/` }, filename: name, iCalString: ics });
+    if (r.status === 412) r = await client.updateCalendarObject({ calendarObject: { url: target, data: ics } }); // already exists
     if (!r.ok) return res.status(r.status).json({ error: `iCloud returned ${r.status}` });
-    res.json({ url: url || new URL(name, calendarId).toString(), etag: r.headers.get('etag') });
+    res.json({ url: target, etag: r.headers.get('etag'), calendarId: calUrl });
   } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
 
-// 6. Delete event. body: { token, url, etag? }
+// 6. Delete event. body: { token, url }
 app.post('/apple/calendar/event/delete', express.json(), async (req, res) => {
   try {
     const client = await clientFromReq(req);
-    const r = await client.deleteCalendarObject({ calendarObject: { url: req.body.url, etag: req.body.etag } });
-    res.json({ ok: r.ok || r.status === 404 });
+    const r = await client.deleteCalendarObject({ calendarObject: { url: req.body.url } });
+    res.json({ ok: r.ok || r.status === 404 || r.status === 410 });
   } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
 
-// 7. Incremental changes (poll every few minutes). body: { token, calendarId, syncToken }
+// 7. Incremental changes. body: { token, calendarId, syncToken }
 app.post('/apple/calendar/changes', express.json(), async (req, res) => {
   try {
     const { calendarId, syncToken } = req.body;
     const client = await clientFromReq(req);
-    const r = await client.smartCollectionSync({ collection: { url: calendarId, syncToken, objects: [] }, method: 'webdav', detailedResult: true });
+    const url = await resolveCalendarUrl(client, calendarId);
+    const r = await client.smartCollectionSync({ collection: { url, syncToken, objects: [] }, method: 'webdav', detailedResult: true });
     res.json({ syncToken: r.syncToken, created: r.objects.created, updated: r.objects.updated, deleted: r.objects.deleted });
   } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
+
+
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
