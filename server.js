@@ -6151,12 +6151,26 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
 //   APP-SPECIFIC PASSWORD they create at https://account.apple.com.
 //
 // Reused env keys (already in .env for Sign in with Apple):
-//   COMPANION_DOMAIN, COMPANION_SECRET (JWT state + token signing)
+//   COMPANION_DOMAIN, COMPANION_SECRET (JWT state + token signing + local
+//   credential encryption key derivation)
 //   APPLE_CLIENT_ID (stored on the token for traceability only)
-// No new Apple keys are required. Credentials are encrypted with ./encryption.
+// No new Apple keys are required.
+//
+// IMPORTANT — credential encryption is now SELF-CONTAINED:
+//   The previous version called the remote Encryption API via
+//   ./encryption.js. When that API answered 404 the throw crashed the
+//   whole companion process ("Encryption API failed: 404" in the logs and
+//   the popup closed). This version encrypts locally with AES-256-GCM using
+//   a key derived from COMPANION_SECRET, so no external call can take the
+//   server down. Do NOT reintroduce the remote encryption call here.
+//
+// Branding:
+//   The app passes ?origin=...&company=...&logo=...&color=... so the popup
+//   shows the member's own company name, logo and brand colour. All three
+//   are optional and carried inside the signed state token.
 //
 // Endpoints (mirror Google/Outlook):
-//   GET  /login/apple/calendar?origin=...   -> popup form
+//   GET  /login/apple/calendar?origin=...&company=...&logo=...&color=...
 //   POST /login/apple/calendar/connect      -> verify + postMessage token
 //   GET  /login/tokeninfo/apple             -> decode token (server use)
 //   POST /apple/calendar/list               -> list calendars
@@ -6167,8 +6181,8 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
 //
 // npm i tsdav   (CalDAV client; works with iCloud)
 
+const crypto = require('crypto');
 const { DAVClient } = require('tsdav');
-const { decrypt } = require('./encryption'); // encrypt is already imported above
 
 const APPLE_CAL = {
   SERVER_URL: 'https://caldav.icloud.com',
@@ -6180,13 +6194,44 @@ const APPLE_CAL = {
   // companion accepts any origin the app sends.
 };
 
-
 const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 // Apple IDs are case-insensitive; app passwords are shown as "abcd-efgh-ijkl-mnop"
 // and are often pasted with spaces or upper case. Normalise both before use.
 const normAppleId = (v) => String(v ?? '').trim().toLowerCase();
 const normAppPassword = (v) => String(v ?? '').replace(/\s+/g, '').toLowerCase();
+
+// Branding from the app: short plain text / https URL / hex colour only.
+const normBrandText = (v, max = 80) => String(v ?? '').trim().slice(0, max);
+const normBrandLogo = (v) => {
+  const s = String(v ?? '').trim();
+  return /^https:\/\//i.test(s) && s.length <= 500 ? s : '';
+};
+const normBrandColor = (v) => {
+  const s = String(v ?? '').trim();
+  return /^#[0-9a-fA-F]{6}$/.test(s) ? s : '';
+};
+
+// ---------------------------------------------------------------------------
+// Local credential encryption (AES-256-GCM, key derived from COMPANION_SECRET)
+// ---------------------------------------------------------------------------
+function appleCalKey() {
+  if (!APPLE_CAL.JWT_SECRET) throw new Error('COMPANION_SECRET is not set');
+  return crypto.createHash('sha256').update(`apple-calendar:${APPLE_CAL.JWT_SECRET}`).digest();
+}
+function encryptAppleCred(plaintext) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', appleCalKey(), iv);
+  const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  // iv | auth tag | ciphertext, base64 — one opaque value inside the JWT.
+  return Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64');
+}
+function decryptAppleCred(stored) {
+  const buf = Buffer.from(stored, 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', appleCalKey(), buf.subarray(0, 12));
+  decipher.setAuthTag(buf.subarray(12, 28));
+  return Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
+}
 
 /**
  * Checks the credentials directly against iCloud before using tsdav, and finds
@@ -6241,17 +6286,17 @@ async function appleDavClient(appleId, appPassword, serverUrl = APPLE_CAL.SERVER
   return client;
 }
 
-// Token = JWT wrapping encrypted credentials. Only the companion can open it.
+// Token = JWT wrapping locally encrypted credentials. Only the companion can open it.
 function signAppleCalendarToken(appleId, appPassword, serverUrl) {
   return jwt.sign(
-    { provider: 'apple_calendar', appleId, cred: encrypt(JSON.stringify({ appleId, appPassword, serverUrl })), cid: APPLE_CAL.CLIENT_ID },
+    { provider: 'apple_calendar', appleId, cred: encryptAppleCred(JSON.stringify({ appleId, appPassword, serverUrl })), cid: APPLE_CAL.CLIENT_ID },
     APPLE_CAL.JWT_SECRET,
   );
 }
 function openAppleCalendarToken(token) {
   const d = jwt.verify(token, APPLE_CAL.JWT_SECRET);
   if (d.provider !== 'apple_calendar') throw new Error('Wrong token type');
-  return JSON.parse(decrypt(d.cred));
+  return JSON.parse(decryptAppleCred(d.cred));
 }
 async function clientFromReq(req) {
   const token = req.body?.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -6260,30 +6305,71 @@ async function clientFromReq(req) {
   return appleDavClient(appleId, appPassword, serverUrl || APPLE_CAL.SERVER_URL);
 }
 
-// 1. Popup form
+// ---------------------------------------------------------------------------
+// 1. Popup form — Material-style, branded with the member's company
+// ---------------------------------------------------------------------------
 app.get('/login/apple/calendar', (req, res) => {
   const { origin } = req.query;
   if (!origin) return res.status(400).send('Missing origin.');
-  const state = jwt.sign({ origin }, APPLE_CAL.JWT_SECRET, { expiresIn: '10m' });
-  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Apple Calendar</title>
-<style>body{font-family:-apple-system,Arial,sans-serif;max-width:420px;margin:32px auto;padding:0 20px;color:#111}
-label{display:block;margin-top:14px;font-size:14px;font-weight:600}input{width:100%;box-sizing:border-box;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:8px;font-size:15px}
-button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:8px;background:#111;color:#fff;font-size:15px;cursor:pointer}
-.hint{font-size:13px;color:#555;line-height:1.45}#err{color:#c00;font-size:14px;margin-top:12px}</style></head><body>
-<h2>Connect Apple Calendar</h2>
-<p class="hint">Use your Apple ID email and an <b>app-specific password</b> (not your normal password). Create one at
-<a href="https://account.apple.com/account/manage" target="_blank" rel="noopener">account.apple.com</a> → Sign-In and Security → App-Specific Passwords.</p>
-<form id="f"><input type="hidden" name="state" value="${escHtml(state)}">
-<label>Apple ID email<input name="appleId" type="email" required autocomplete="username"></label>
-<label>App-specific password<input name="appPassword" type="password" required placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off"></label>
-<button type="submit" id="b">Connect</button><div id="err"></div></form>
+  const brand = {
+    company: normBrandText(req.query.company),
+    logo: normBrandLogo(req.query.logo),
+    color: normBrandColor(req.query.color) || '#009b91',
+  };
+  const state = jwt.sign({ origin, brand }, APPLE_CAL.JWT_SECRET, { expiresIn: '10m' });
+  const company = brand.company || 'your workspace';
+  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect Apple Calendar — ${escHtml(company)}</title>
+<style>
+:root{--brand:${escHtml(brand.color)};--ink:#1b1b1f;--muted:#5f5f66;--line:#e4e4ea;--bg:#f6f7f9;--card:#ffffff;--err:#b3261e;--err-bg:#fce8e6}
+*{box-sizing:border-box}body{margin:0;font-family:Roboto,-apple-system,"Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--ink);display:flex;justify-content:center;padding:24px 16px}
+.card{background:var(--card);border-radius:16px;box-shadow:0 1px 3px rgba(0,0,0,.12),0 4px 12px rgba(0,0,0,.08);max-width:460px;width:100%;overflow:hidden}
+.head{padding:24px 24px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px}
+.head img{width:44px;height:44px;border-radius:10px;object-fit:contain}
+.mark{width:44px;height:44px;border-radius:10px;background:var(--brand);color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700}
+.head h1{font-size:19px;margin:0;line-height:1.25}.head p{margin:3px 0 0;font-size:13px;color:var(--muted)}
+.body{padding:20px 24px 24px}
+.steps{background:var(--bg);border-radius:12px;padding:14px 16px;margin:0 0 18px;font-size:13px;color:var(--muted);line-height:1.5}
+.steps ol{margin:6px 0 0;padding-left:18px}.steps li{margin:5px 0}.steps b{color:var(--ink)}
+.steps a{color:var(--brand);font-weight:600;text-decoration:none}
+label{display:block;margin-top:14px;font-size:13px;font-weight:600;color:var(--ink)}
+input{width:100%;box-sizing:border-box;padding:12px 14px;margin-top:6px;border:1px solid var(--line);border-radius:10px;font-size:15px;background:#fff;transition:border-color .15s,box-shadow .15s}
+input:focus{outline:0;border-color:var(--brand);box-shadow:0 0 0 3px color-mix(in srgb,var(--brand) 18%,transparent)}
+button{margin-top:22px;width:100%;padding:13px;border:0;border-radius:10px;background:var(--brand);color:#fff;font-size:15px;font-weight:600;cursor:pointer;box-shadow:0 2px 6px color-mix(in srgb,var(--brand) 40%,transparent);transition:filter .15s}
+button:hover{filter:brightness(1.06)}button:disabled{opacity:.6;cursor:default}
+#err{display:none;margin-top:14px;padding:11px 14px;border-radius:10px;background:var(--err-bg);color:var(--err);font-size:13px;line-height:1.45}
+.foot{margin-top:16px;font-size:12px;color:var(--muted);text-align:center;line-height:1.5}
+</style></head><body>
+<div class="card">
+  <div class="head">
+    ${brand.logo ? `<img src="${escHtml(brand.logo)}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'mark',textContent:'${escHtml((brand.company || 'A')[0].toUpperCase())}'}))">` : `<div class="mark">${escHtml((brand.company || 'A')[0].toUpperCase())}</div>`}
+    <div><h1>Connect Apple Calendar</h1><p>Two-way sync with ${escHtml(company)}</p></div>
+  </div>
+  <div class="body">
+    <div class="steps">
+      <b>Before you start — you need an app-specific password:</b>
+      <ol>
+        <li>Open <a href="https://account.apple.com" target="_blank" rel="noopener">account.apple.com</a> and sign in.</li>
+        <li>Go to <b>Sign-In and Security → App-Specific Passwords</b>.</li>
+        <li>Generate a password (name it “${escHtml(company)}” so you recognise it) and copy it.</li>
+        <li>Paste it below — <b>not</b> your normal Apple Account password.</li>
+      </ol>
+    </div>
+    <form id="f"><input type="hidden" name="state" value="${escHtml(state)}">
+      <label>Apple ID email<input name="appleId" type="email" required autocomplete="username" placeholder="you@icloud.com"></label>
+      <label>App-specific password<input name="appPassword" type="password" required placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off"></label>
+      <button type="submit" id="b">Connect Apple Calendar</button><div id="err" role="alert"></div>
+    </form>
+    <p class="foot">Your details are encrypted and used only to sync your calendars with ${escHtml(company)}. You can revoke the app-specific password at any time at account.apple.com.</p>
+  </div>
+</div>
 <script>
-document.getElementById('f').onsubmit=async(e)=>{e.preventDefault();const b=document.getElementById('b');b.disabled=true;b.textContent='Connecting…';
-const r=await fetch('/login/apple/calendar/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});
+document.getElementById('f').onsubmit=async(e)=>{e.preventDefault();const b=document.getElementById('b');const errBox=document.getElementById('err');errBox.style.display='none';b.disabled=true;b.textContent='Connecting…';
+try{const r=await fetch('/login/apple/calendar/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});
 const j=await r.json().catch(()=>({}));
-if(!r.ok){document.getElementById('err').textContent=j.error||'Could not connect.';b.disabled=false;b.textContent='Connect';return;}
+if(!r.ok){errBox.textContent=j.error||'Could not connect. Please try again.';errBox.style.display='block';b.disabled=false;b.textContent='Connect Apple Calendar';return;}
 if(window.opener){window.opener.postMessage({source:'companion-apple-calendar',status:'success',loginToken:j.token,calendars:j.calendars},j.origin);}
-setTimeout(()=>window.close(),150);};
+setTimeout(()=>window.close(),150);}catch(_){errBox.textContent='Network problem — please check your connection and try again.';errBox.style.display='block';b.disabled=false;b.textContent='Connect Apple Calendar';}};
 </script></body></html>`);
 });
 
@@ -6301,7 +6387,7 @@ app.post('/login/apple/calendar/connect', express.json(), async (req, res) => {
     const appPassword = normAppPassword(body.appPassword);
     if (!appleId || !appPassword) return res.status(400).json({ error: 'Apple ID and app-specific password are required.' });
     if (!/^[a-z]{4}-?[a-z]{4}-?[a-z]{4}-?[a-z]{4}$/.test(appPassword)) {
-      return res.status(400).json({ error: 'That does not look like an app-specific password. It has 16 letters, like abcd-efgh-ijkl-mnop. Your normal Apple ID password will not work.' });
+      return res.status(400).json({ error: 'That does not look like an app-specific password. It has 16 letters, like abcd-efgh-ijkl-mnop. Your normal Apple Account password will not work.' });
     }
     const serverUrl = await icloudPreflight(appleId, appPassword);
     const client = await appleDavClient(appleId, appPassword, serverUrl);
@@ -6355,7 +6441,7 @@ app.post('/apple/calendar/event', express.json({ limit: '1mb' }), async (req, re
     const { calendarId, uid, ics, url, etag } = req.body;
     if (!ics || !/BEGIN:VCALENDAR/.test(ics)) return res.status(400).json({ error: 'ics required' });
     const client = await clientFromReq(req);
-    const name = `${uid || randomUUID()}.ics`;
+    const name = `${uid || crypto.randomUUID()}.ics`;
     const r = url
       ? await client.updateCalendarObject({ calendarObject: { url, data: ics, etag } })
       : await client.createCalendarObject({ calendar: { url: calendarId }, filename: name, iCalString: ics });
@@ -6382,7 +6468,6 @@ app.post('/apple/calendar/changes', express.json(), async (req, res) => {
     res.json({ syncToken: r.syncToken, created: r.objects.created, updated: r.objects.updated, deleted: r.objects.deleted });
   } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
 });
-
 
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
