@@ -5663,7 +5663,6 @@ app.get('/login/tokeninfo/mailbox', (req, res) => {
 ///////////   Outlook Mailbox & Calendar (Microsoft)  ////////
 /////////////////////////////////////////////////////////////
 
-
 const sharedSecret = process.env.COMPANION_SECRET;
 const serviceHost = process.env.COMPANION_DOMAIN;
 const cookieOptions = { httpOnly: true, secure: true, sameSite: 'lax', path: '/' };
@@ -5763,7 +5762,11 @@ app.get('/login/outlook/mailbox', (req, res) => {
     const cookie = jwt.sign({ purpose: 'mailbox', state, origin, verifier }, sharedSecret, { algorithm: 'HS256', expiresIn: '5m' });
     res.cookie('outlook_mailbox_auth_state', cookie, { ...cookieOptions, maxAge: 300000 });
     const query = new URLSearchParams({ client_id: clientId, response_type: 'code', response_mode: 'query',
-      redirect_uri: redirect, scope: MAILBOX_SCOPES.join(' '), state, prompt: 'consent',
+      redirect_uri: redirect, scope: MAILBOX_SCOPES.join(' '), state,
+      // select_account instead of forced consent: forcing prompt=consent on an
+      // already-granted personal account can complete the legacy Consent/Update
+      // page without returning a refresh_token. A normal round returns it.
+      prompt: 'select_account',
       code_challenge: crypto.createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' });
     res.set('Cache-Control', 'no-store');
     return res.redirect(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${query}`);
@@ -5855,6 +5858,19 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
       const code = String(token?.error || `token_http_${response.status}`);
       throw new Error(/^[a-zA-Z0-9_]+$/.test(code) ? code : 'token_failed');
     }
+    // Safety net: if the first round still completes without a refresh_token,
+    // run the popup through full consent exactly once with a fresh PKCE pair.
+    if (!token.refresh_token && !state.retry) {
+      const retryState = crypto.randomBytes(32).toString('base64url');
+      const retryVerifier = crypto.randomBytes(32).toString('base64url');
+      const retryCookie = jwt.sign({ purpose: 'mailbox', state: retryState, origin, verifier: retryVerifier, retry: true }, sharedSecret, { algorithm: 'HS256', expiresIn: '5m' });
+      res.cookie('outlook_mailbox_auth_state', retryCookie, { ...cookieOptions, maxAge: 300000 });
+      const retryQuery = new URLSearchParams({ client_id: clientId, response_type: 'code', response_mode: 'query',
+        redirect_uri: serviceOrigin() + '/login/outlook/mailbox/callback', scope: MAILBOX_SCOPES.join(' '), state: retryState, prompt: 'consent',
+        code_challenge: crypto.createHash('sha256').update(retryVerifier).digest('base64url'), code_challenge_method: 'S256' });
+      res.set('Cache-Control', 'no-store');
+      return res.redirect(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${retryQuery}`);
+    }
     if (!token.refresh_token) throw new Error('offline_access_not_granted');
     const granted = new Set(String(token.scope || '').split(/\s+/).map(s => s.replace(/^https:\/\/graph\.microsoft\.com\//i, '').toLowerCase()));
     for (const scope of MAILBOX_SCOPES.filter(s => s.includes('.'))) {
@@ -5913,6 +5929,7 @@ app.get('/login/tokeninfo/mailbox', (req, res) => {
     return res.status(401).json({ failed: true, error: 'Invalid or expired connection token; reconnect.' });
   }
 });
+
 
 
 
