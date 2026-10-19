@@ -5952,12 +5952,12 @@ app.get('/login/tokeninfo/outlook', (req, res) => {
   }
 });
 
-app.get('/login/tokeninfo/mailbox', (req, res) => {
+app.get('/login/tokeninfo/outlook-mailbox', (req, res) => {
   res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
   if (typeof req.query.token !== 'string') return res.status(400).json({ failed: true, error: 'Token is required' });
   try {
-    // Retains legacy Google-mailbox handoffs without the outlook envelope.
-    const info = unseal(req.query.token, 'mailbox', true);
+    // Outlook-only verifier; Google Mailbox keeps /login/tokeninfo/mailbox.
+    const info = unseal(req.query.token, 'mailbox');
     if (!info.refresh_token || !info.access_token) throw new Error('invalid_handoff');
     const remaining = info.access_expires_at ? Math.max(0, Math.floor((info.access_expires_at - Date.now()) / 1000)) : Number(info.expires_in || 0);
     if (remaining <= 0) throw new Error('expired_handoff');
