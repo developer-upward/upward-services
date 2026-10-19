@@ -6639,8 +6639,9 @@ app.post('/apple/calendar/changes', express.json(), async (req, res) => {
 // Required env vars:
 //   COMPANION_SECRET
 //   LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET
-//   SOCIAL_OAUTH_ALLOWED_ORIGINS   (comma-separated exact https origins)
-//   SOCIAL_OAUTH_ENABLED_PROVIDERS=linkedin
+// Which sites may connect LinkedIn is decided by the Upward app, not here.
+// Any https origin may start the flow; the token handoff is sealed with
+// COMPANION_SECRET so only the Upward app server can open it.
 // LinkedIn app: add products "Sign In with LinkedIn using OpenID Connect"
 // and "Share on LinkedIn"; callback URL must be exactly
 // https://services.upward.page/social/oauth/linkedin/callback
@@ -6651,24 +6652,12 @@ const LINKEDIN_AUTHORIZE_URL = 'https://www.linkedin.com/oauth/v2/authorization'
 const LINKEDIN_TOKEN_URL = 'https://www.linkedin.com/oauth/v2/accessToken';
 const LINKEDIN_SCOPES = 'openid profile w_member_social';
 const LINKEDIN_CALLBACK_URL = 'https://services.upward.page/social/oauth/linkedin/callback';
-const LINKEDIN_ALLOWED_ORIGINS = new Set(
-  (process.env.SOCIAL_OAUTH_ALLOWED_ORIGINS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-);
+const linkedinValidOrigin = (value) => {
+  try { return typeof value === 'string' && value.startsWith('https://') && new URL(value).origin === value; } catch { return false; }
+};
 
 function linkedinConfig() {
-  const enabled = (process.env.SOCIAL_OAUTH_ENABLED_PROVIDERS || '')
-    .split(',')
-    .map((s) => s.trim());
-  if (
-    !process.env.COMPANION_SECRET ||
-    !enabled.includes(LINKEDIN_PROVIDER) ||
-    !process.env.LINKEDIN_CLIENT_ID ||
-    !process.env.LINKEDIN_CLIENT_SECRET ||
-    LINKEDIN_ALLOWED_ORIGINS.size === 0
-  ) {
+  if (!process.env.COMPANION_SECRET || !process.env.LINKEDIN_CLIENT_ID || !process.env.LINKEDIN_CLIENT_SECRET) {
     throw new Error('Provider unavailable');
   }
 }
@@ -6715,7 +6704,7 @@ function linkedinReadState(state) {
   });
   if (
     s.provider !== LINKEDIN_PROVIDER ||
-    !LINKEDIN_ALLOWED_ORIGINS.has(s.origin) ||
+    !linkedinValidOrigin(s.origin) ||
     !s.appState ||
     !s.challenge ||
     s.redirect !== LINKEDIN_CALLBACK_URL
@@ -6740,10 +6729,7 @@ app.get('/social/oauth/linkedin/start', (req, res) => {
     linkedinConfig();
     const { origin: target, state: appState, challenge } = req.query;
     if (
-      typeof target !== 'string' ||
-      !LINKEDIN_ALLOWED_ORIGINS.has(target) ||
-      new URL(target).origin !== target ||
-      !target.startsWith('https://')
+      !linkedinValidOrigin(target)
     ) {
       throw new Error('Invalid origin');
     }
@@ -6883,7 +6869,6 @@ app.post('/social/oauth/linkedin/exchange', express.json(), async (req, res) => 
 });
 
 // ///////////// END LINKEDIN SOCIAL OAUTH /////////////
-
 
 
 
