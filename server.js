@@ -6627,6 +6627,266 @@ app.post('/apple/calendar/changes', express.json(), async (req, res) => {
 
 
 
+
+///////////////////////////////////////////////////
+//////  LINKEDIN SOCIAL OAUTH (SOCIALIZER)  ///////
+///////////////////////////////////////////////////
+// Paste this whole block in server.js ABOVE the final 404 handler
+// (app.use((req, res) => { ... res.status(404) ... })) and BELOW the
+// existing `const crypto = require('crypto');` line.
+// Uses the crypto, jwt, fetch and express already imported in this file.
+//
+// Required env vars:
+//   COMPANION_SECRET
+//   LINKEDIN_CLIENT_ID, LINKEDIN_CLIENT_SECRET
+//   SOCIAL_OAUTH_ALLOWED_ORIGINS   (comma-separated exact https origins)
+//   SOCIAL_OAUTH_ENABLED_PROVIDERS=linkedin
+// LinkedIn app: add products "Sign In with LinkedIn using OpenID Connect"
+// and "Share on LinkedIn"; callback URL must be exactly
+// https://services.upward.page/social/oauth/linkedin/callback
+// Scopes requested: openid profile w_member_social
+
+const LINKEDIN_PROVIDER = 'linkedin';
+const LINKEDIN_AUTHORIZE_URL = 'https://www.linkedin.com/oauth/v2/authorization';
+const LINKEDIN_TOKEN_URL = 'https://www.linkedin.com/oauth/v2/accessToken';
+const LINKEDIN_SCOPES = 'openid profile w_member_social';
+const LINKEDIN_CALLBACK_URL = 'https://services.upward.page/social/oauth/linkedin/callback';
+const LINKEDIN_ALLOWED_ORIGINS = new Set(
+  (process.env.SOCIAL_OAUTH_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+
+function linkedinConfig() {
+  const enabled = (process.env.SOCIAL_OAUTH_ENABLED_PROVIDERS || '')
+    .split(',')
+    .map((s) => s.trim());
+  if (
+    !process.env.COMPANION_SECRET ||
+    !enabled.includes(LINKEDIN_PROVIDER) ||
+    !process.env.LINKEDIN_CLIENT_ID ||
+    !process.env.LINKEDIN_CLIENT_SECRET ||
+    LINKEDIN_ALLOWED_ORIGINS.size === 0
+  ) {
+    throw new Error('Provider unavailable');
+  }
+}
+
+const linkedinChallengeFor = (verifier) =>
+  crypto.createHash('sha256').update(verifier).digest('base64url');
+
+function linkedinSeal(value, secret) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(
+    'aes-256-gcm',
+    crypto.createHash('sha256').update(secret).digest(),
+    iv,
+  );
+  const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64url');
+}
+
+function linkedinOpen(value, secret) {
+  const data = Buffer.from(value, 'base64url');
+  if (data.length < 29 || data.length > 16384) throw new Error('Invalid handoff');
+  const decipher = crypto.createDecipheriv(
+    'aes-256-gcm',
+    crypto.createHash('sha256').update(secret).digest(),
+    data.subarray(0, 12),
+  );
+  decipher.setAuthTag(data.subarray(12, 28));
+  return JSON.parse(Buffer.concat([decipher.update(data.subarray(28)), decipher.final()]).toString());
+}
+
+function linkedinSafeJson(value) {
+  return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
+function linkedinPopupHtml(origin, payload) {
+  return `<!doctype html><html><head><meta name="referrer" content="no-referrer"><title>LinkedIn account connection</title></head><body><p>You can close this window.</p><script>if(window.opener){window.opener.postMessage(${linkedinSafeJson(payload)},${linkedinSafeJson(origin)});window.close();}</script></body></html>`;
+}
+
+function linkedinReadState(state) {
+  const s = jwt.verify(state, process.env.COMPANION_SECRET, {
+    algorithms: ['HS256'],
+    audience: 'social-oauth',
+    issuer: 'https://services.upward.page',
+  });
+  if (
+    s.provider !== LINKEDIN_PROVIDER ||
+    !LINKEDIN_ALLOWED_ORIGINS.has(s.origin) ||
+    !s.appState ||
+    !s.challenge ||
+    s.redirect !== LINKEDIN_CALLBACK_URL
+  ) {
+    throw new Error('Invalid state');
+  }
+  return s;
+}
+
+app.get('/social/oauth/capabilities', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  let providers = [];
+  try {
+    linkedinConfig();
+    providers = [LINKEDIN_PROVIDER];
+  } catch {}
+  res.json({ providers });
+});
+
+app.get('/social/oauth/linkedin/start', (req, res) => {
+  try {
+    linkedinConfig();
+    const { origin: target, state: appState, challenge } = req.query;
+    if (
+      typeof target !== 'string' ||
+      !LINKEDIN_ALLOWED_ORIGINS.has(target) ||
+      new URL(target).origin !== target ||
+      !target.startsWith('https://')
+    ) {
+      throw new Error('Invalid origin');
+    }
+    if (
+      typeof appState !== 'string' ||
+      appState.length > 8192 ||
+      !appState ||
+      typeof challenge !== 'string' ||
+      !/^[A-Za-z0-9_-]{43}$/.test(challenge)
+    ) {
+      throw new Error('Invalid request');
+    }
+    const state = jwt.sign(
+      {
+        provider: LINKEDIN_PROVIDER,
+        origin: target,
+        appState,
+        challenge,
+        redirect: LINKEDIN_CALLBACK_URL,
+        nonce: crypto.randomBytes(32).toString('base64url'),
+      },
+      process.env.COMPANION_SECRET,
+      { algorithm: 'HS256', expiresIn: '10m', audience: 'social-oauth', issuer: 'https://services.upward.page' },
+    );
+    const url = new URL(LINKEDIN_AUTHORIZE_URL);
+    // LinkedIn confidential web clients do not use PKCE at the provider;
+    // the handoff back to Upward is separately PKCE-bound.
+    url.search = new URLSearchParams({
+      client_id: process.env.LINKEDIN_CLIENT_ID,
+      redirect_uri: LINKEDIN_CALLBACK_URL,
+      response_type: 'code',
+      scope: LINKEDIN_SCOPES,
+      state,
+    }).toString();
+    res.set('Cache-Control', 'no-store');
+    res.redirect(url.toString());
+  } catch {
+    res.status(400).json({ error: 'Connection unavailable or invalid request.' });
+  }
+});
+
+app.get('/social/oauth/linkedin/callback', (req, res) => {
+  try {
+    linkedinConfig();
+    const s = linkedinReadState(req.query.state);
+    const payload = { source: 'companion-social-oauth', provider: LINKEDIN_PROVIDER, state: s.appState };
+    if (req.query.error) {
+      Object.assign(payload, { status: 'error', error: 'Authorization was declined.' });
+    } else {
+      if (typeof req.query.code !== 'string' || !req.query.code || req.query.code.length > 8192) {
+        throw new Error('Missing code');
+      }
+      Object.assign(payload, {
+        status: 'success',
+        ticket: linkedinSeal(
+          {
+            provider: LINKEDIN_PROVIDER,
+            code: req.query.code,
+            redirect: s.redirect,
+            challenge: s.challenge,
+            appState: s.appState,
+            expires: Date.now() + 120000,
+          },
+          process.env.COMPANION_SECRET,
+        ),
+      });
+    }
+    res.set({
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'none'",
+    });
+    res.type('html').send(linkedinPopupHtml(s.origin, payload));
+  } catch {
+    res.status(400).send('Invalid or expired authorization. Close this window and reconnect.');
+  }
+});
+
+app.post('/social/oauth/linkedin/exchange', express.json(), async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    linkedinConfig();
+    const { ticket, verifier, state } = req.body || {};
+    if (
+      typeof ticket !== 'string' ||
+      ticket.length > 22000 ||
+      typeof verifier !== 'string' ||
+      !/^[A-Za-z0-9_-]{43,128}$/.test(verifier)
+    ) {
+      throw new Error('Invalid proof');
+    }
+    const t = linkedinOpen(ticket, process.env.COMPANION_SECRET);
+    if (
+      t.provider !== LINKEDIN_PROVIDER ||
+      t.redirect !== LINKEDIN_CALLBACK_URL ||
+      t.expires <= Date.now() ||
+      t.appState !== state ||
+      t.challenge !== linkedinChallengeFor(verifier)
+    ) {
+      throw new Error('Invalid proof');
+    }
+    const response = await fetch(LINKEDIN_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: t.code,
+        redirect_uri: t.redirect,
+        client_id: process.env.LINKEDIN_CLIENT_ID,
+        client_secret: process.env.LINKEDIN_CLIENT_SECRET,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) throw new Error('Exchange failed');
+    const token = await response.json();
+    if (typeof token.access_token !== 'string' || !token.access_token) throw new Error('No token');
+    const me = await fetch('https://api.linkedin.com/v2/userinfo', {
+      headers: { Authorization: `Bearer ${token.access_token}` },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!me.ok) throw new Error('Profile unavailable');
+    const profile = await me.json();
+    if (!profile.sub) throw new Error('Profile unavailable');
+    const accounts = [{ id: String(profile.sub), name: profile.name || 'LinkedIn account', type: 'profile' }];
+    res.json({
+      accounts,
+      accessToken: token.access_token,
+      ...(token.refresh_token ? { refreshToken: token.refresh_token } : {}),
+      ...(Number(token.expires_in) > 0
+        ? { expiresAt: new Date(Date.now() + Number(token.expires_in) * 1000).toISOString() }
+        : {}),
+      scopes: String(token.scope || LINKEDIN_SCOPES).split(/[ ,]+/).filter(Boolean),
+    });
+  } catch {
+    res.status(400).json({ error: 'Connection could not be verified. Reconnect or check provider permissions.' });
+  }
+});
+
+// ///////////// END LINKEDIN SOCIAL OAUTH /////////////
+
+
+
+
 ///////////////////////////////////////////////////
 ///////////         Server        /////////////////
 ///////////////////////////////////////////////////
