@@ -5741,7 +5741,7 @@ app.get('/login/outlook/calendar', (req, res) => {
     const cookie = jwt.sign({ purpose: 'calendar', state, origin, verifier }, sharedSecret, { algorithm: 'HS256', expiresIn: '5m' });
     res.cookie('outlook_auth_state', cookie, { ...cookieOptions, maxAge: 300000 });
     const query = new URLSearchParams({ client_id: clientId, response_type: 'code', response_mode: 'query',
-      redirect_uri: redirect, scope: CALENDAR_SCOPES.join(' '), state, prompt: 'select_account',
+      redirect_uri: redirect, scope: CALENDAR_SCOPES.join(' '), state, prompt: 'consent',
       code_challenge: crypto.createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' });
     res.set('Cache-Control', 'no-store');
     return res.redirect(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${query}`);
@@ -5763,7 +5763,7 @@ app.get('/login/outlook/mailbox', (req, res) => {
     const cookie = jwt.sign({ purpose: 'mailbox', state, origin, verifier }, sharedSecret, { algorithm: 'HS256', expiresIn: '5m' });
     res.cookie('outlook_mailbox_auth_state', cookie, { ...cookieOptions, maxAge: 300000 });
     const query = new URLSearchParams({ client_id: clientId, response_type: 'code', response_mode: 'query',
-      redirect_uri: redirect, scope: MAILBOX_SCOPES.join(' '), state, prompt: 'select_account',
+      redirect_uri: redirect, scope: MAILBOX_SCOPES.join(' '), state, prompt: 'consent',
       code_challenge: crypto.createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' });
     res.set('Cache-Control', 'no-store');
     return res.redirect(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${query}`);
