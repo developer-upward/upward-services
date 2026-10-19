@@ -5728,6 +5728,36 @@ function safeError(error) {
   return /^[a-zA-Z0-9_]+$/.test(code) && code.length < 80 ? code : 'connection_failed';
 }
 
+// Curated, credential-free guidance for the failures an owner can actually act on.
+const CONNECTION_HINTS = {
+  offline_access_permission_missing: 'Microsoft did not grant "Offline access" (offline_access), so no refresh token was issued. In the Entra app registration: API permissions -> Add a permission -> Microsoft Graph -> Delegated -> Offline access -> offline_access -> Add permissions, then reconnect the mailbox.',
+  offline_access_not_granted: 'Microsoft withheld the refresh token even after full consent. Reconnect the mailbox and approve every requested permission, or try a different mailbox account.',
+  required_scope_not_granted: 'Microsoft did not grant every permission Upward requested. Reconnect and approve all requested permissions.',
+};
+
+function grantedScopes(token) {
+  return new Set(String(token.scope || '').split(/\s+/).map(s => s.replace(/^https:\/\/graph\.microsoft\.com\//i, '').toLowerCase()));
+}
+
+// A refresh_token only arrives when the grant keeps offline_access, and Microsoft only
+// offers that permission when the Entra app registration declares it. Name the missing
+// piece instead of asking the builder to guess about consent.
+function missingRefreshError(token) {
+  // Permission names, never tokens: the builder needs to see exactly what
+  // Microsoft's grant contained to tell a stale consent from a missing permission.
+  const granted = [...grantedScopes(token)];
+  const error = new Error(granted.includes('offline_access') ? 'offline_access_not_granted' : 'offline_access_permission_missing');
+  error.grantedScopes = granted;
+  return error;
+}
+
+function outlookConnectionFailed(res, origin, source, code, granted) {
+  const base = CONNECTION_HINTS[code] || `Microsoft connection failed (${code}). Please reconnect.`;
+  const hint = Array.isArray(granted) && granted.length ? `${base} Microsoft granted: ${granted.join(', ')}.` : base;
+  if (origin) return popup(res, origin, source, { status: 'error', code, error: hint });
+  return res.status(400).json({ failed: true, error: code, hint });
+}
+
 app.get('/login/outlook/calendar', (req, res) => {
   try {
     const origin = exactOrigin(req.query.origin);
@@ -5763,10 +5793,10 @@ app.get('/login/outlook/mailbox', (req, res) => {
     res.cookie('outlook_mailbox_auth_state', cookie, { ...cookieOptions, maxAge: 300000 });
     const query = new URLSearchParams({ client_id: clientId, response_type: 'code', response_mode: 'query',
       redirect_uri: redirect, scope: MAILBOX_SCOPES.join(' '), state,
-      // select_account instead of forced consent: forcing prompt=consent on an
-      // already-granted personal account can complete the legacy Consent/Update
-      // page without returning a refresh_token. A normal round returns it.
-      prompt: 'select_account',
+      // Force a fresh consent evaluation. With select_account Microsoft reuses the
+      // cached grant, and a cached grant that predates offline_access comes back
+      // without it, so the token endpoint issues an access token and no refresh_token.
+      prompt: 'consent',
       code_challenge: crypto.createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' });
     res.set('Cache-Control', 'no-store');
     return res.redirect(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${query}`);
@@ -5803,8 +5833,21 @@ app.get('/login/outlook/callback', async (req, res) => {
       const code = String(token?.error || `token_http_${response.status}`);
       throw new Error(/^[a-zA-Z0-9_]+$/.test(code) ? code : 'token_failed');
     }
-    if (!token.refresh_token) throw new Error('offline_access_not_granted');
-    const granted = new Set(String(token.scope || '').split(/\s+/).map(s => s.replace(/^https:\/\/graph\.microsoft\.com\//i, '').toLowerCase()));
+    // Safety net: if the round completes without a refresh_token, run the popup
+    // through full consent exactly once with a fresh PKCE pair.
+    if (!token.refresh_token && !state.retry) {
+      const retryState = crypto.randomBytes(32).toString('base64url');
+      const retryVerifier = crypto.randomBytes(32).toString('base64url');
+      const retryCookie = jwt.sign({ purpose: 'calendar', state: retryState, origin, verifier: retryVerifier, retry: true }, sharedSecret, { algorithm: 'HS256', expiresIn: '5m' });
+      res.cookie('outlook_auth_state', retryCookie, { ...cookieOptions, maxAge: 300000 });
+      const retryQuery = new URLSearchParams({ client_id: clientId, response_type: 'code', response_mode: 'query',
+        redirect_uri: serviceOrigin() + '/login/outlook/callback', scope: CALENDAR_SCOPES.join(' '), state: retryState, prompt: 'consent',
+        code_challenge: crypto.createHash('sha256').update(retryVerifier).digest('base64url'), code_challenge_method: 'S256' });
+      res.set('Cache-Control', 'no-store');
+      return res.redirect(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${retryQuery}`);
+    }
+    if (!token.refresh_token) throw missingRefreshError(token);
+    const granted = grantedScopes(token);
     for (const scope of CALENDAR_SCOPES.filter(s => s.includes('.'))) {
       if (!granted.has(scope.toLowerCase())) throw new Error('required_scope_not_granted');
     }
@@ -5823,9 +5866,7 @@ app.get('/login/outlook/callback', async (req, res) => {
     };
     return popup(res, origin, 'companion-outlook-calendar', { status: 'success', loginToken: seal(handoff, 'calendar') });
   } catch (error) {
-    const code = safeError(error);
-    if (origin) return popup(res, origin, 'companion-outlook-calendar', { status: 'error', error: `Microsoft connection failed (${code}). Please reconnect.` });
-    return res.status(400).json({ failed: true, error: code });
+    return outlookConnectionFailed(res, origin, 'companion-outlook-calendar', safeError(error), error.grantedScopes);
   }
 });
 
@@ -5871,8 +5912,8 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
       res.set('Cache-Control', 'no-store');
       return res.redirect(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${retryQuery}`);
     }
-    if (!token.refresh_token) throw new Error('offline_access_not_granted');
-    const granted = new Set(String(token.scope || '').split(/\s+/).map(s => s.replace(/^https:\/\/graph\.microsoft\.com\//i, '').toLowerCase()));
+    if (!token.refresh_token) throw missingRefreshError(token);
+    const granted = grantedScopes(token);
     for (const scope of MAILBOX_SCOPES.filter(s => s.includes('.'))) {
       if (!granted.has(scope.toLowerCase())) throw new Error('required_scope_not_granted');
     }
@@ -5891,9 +5932,7 @@ app.get('/login/outlook/mailbox/callback', async (req, res) => {
     };
     return popup(res, origin, 'companion-outlook-mailbox', { status: 'success', loginToken: seal(handoff, 'mailbox') });
   } catch (error) {
-    const code = safeError(error);
-    if (origin) return popup(res, origin, 'companion-outlook-mailbox', { status: 'error', error: `Microsoft connection failed (${code}). Please reconnect.` });
-    return res.status(400).json({ failed: true, error: code });
+    return outlookConnectionFailed(res, origin, 'companion-outlook-mailbox', safeError(error), error.grantedScopes);
   }
 });
 
