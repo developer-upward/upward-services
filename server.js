@@ -5668,7 +5668,7 @@ const serviceHost = process.env.COMPANION_DOMAIN;
 const cookieOptions = { httpOnly: true, secure: true, sameSite: 'lax', path: '/' };
 
 const CALENDAR_SCOPES = ['openid', 'profile', 'email', 'offline_access', 'User.Read', 'Calendars.ReadWrite'];
-const MAILBOX_SCOPES = ['openid', 'profile', 'email', 'offline_access', 'User.Read', 'Mail.Read', 'Mail.Send'];
+const MAILBOX_SCOPES = ['openid', 'profile', 'email', 'offline_access', 'User.Read', 'Mail.ReadWrite', 'Mail.Send'];
 
 function exactOrigin(input) {
   if (typeof input !== 'string') throw new Error('invalid_origin');
